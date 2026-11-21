@@ -7,6 +7,7 @@
  * On a PC it also picks pad 1 and remaps the pad and the keyboard; on every
  * platform its last line quits the game. */
 #include "clx_settings.h"
+#include "clx_savestate.h"
 #include "platform/overlay.h"
 
 #include <stdint.h>
@@ -30,7 +31,7 @@ void xa2_set_master_volume(float v);                 /* apu_xaudio2.c */
 void clx_scale_apply(void);                          /* switch_nx.c / here */
 
 enum { RESTART = 1, VK_ONLY = 2, SWITCH_ONLY = 4, GL_RESTART = 8 };
-enum { VALUE, PAD, REMAP_PAD, REMAP_KEYS, RESET, EXIT };
+enum { VALUE, PAD, REMAP_PAD, REMAP_KEYS, RESET, SAVE_STATE, LOAD_STATE, EXIT };
 
 typedef struct {
     const char *label;
@@ -80,6 +81,9 @@ static const Item k_items[] = {
     { "REMAP KEYBOARD", NULL, 0, { 0 }, { 0 }, 0, REMAP_KEYS },
     { "RESET CONTROLS", NULL, 0, { 0 }, { 0 }, 0, RESET },
 #endif
+    { "STATE SLOT", &g_clx.state_slot, 5, { 1, 2, 3, 4, 5 }, { "1", "2", "3", "4", "5" }, 0, VALUE },
+    { "SAVE STATE", NULL, 0, { 0 }, { 0 }, 0, SAVE_STATE },
+    { "LOAD STATE", NULL, 0, { 0 }, { 0 }, 0, LOAD_STATE },
     { "EXIT GAME", NULL, 0, { 0 }, { 0 }, 0, EXIT },
 };
 #define NITEMS ((int)(sizeof k_items / sizeof k_items[0]))
@@ -208,6 +212,11 @@ static void close_menu(void)
     ovl_publish(0);
     clx_options_save();
     printf("[menu] closed\n");
+}
+
+void clx_menu_close(void)
+{
+    close_menu();
 }
 
 /* The window's close button and Alt+F4 (recomp_quit_hook). */
@@ -345,6 +354,14 @@ static void act(const Item *it)
         printf("[menu] controls reset\n");
         break;
 #endif
+    case SAVE_STATE:
+        clx_savestate_request_save(g_clx.state_slot);
+        printf("[menu] save state requested: slot %d\n", g_clx.state_slot);
+        break;
+    case LOAD_STATE:
+        clx_savestate_request_load(g_clx.state_slot);
+        printf("[menu] load state requested: slot %d\n", g_clx.state_slot);
+        break;
     case EXIT:
         if (!s_armed) {
             s_armed = 1;

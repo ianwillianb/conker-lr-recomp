@@ -31,6 +31,8 @@ if(NOT EXISTS "${NFSU2_GEN_DIR}/recomp_funcs.h")
                         "with --gen-dir, or pass -DNFSU2_GEN_DIR=<dir>.")
 endif()
 
+find_package(ZLIB REQUIRED)
+
 # The Vulkan renderer (xboxrecomp nv2a_vk) instead of OpenGL. On the Switch it
 # links mesa-switch's static NVK (NVK_SDK) and builds clx-vulkan.nro.
 option(NFSU2_VULKAN "Render with Vulkan instead of OpenGL" OFF)
@@ -56,6 +58,7 @@ set(GAME_SOURCES
     src/clx_rumble.c
     src/clx_buttons.c
     src/clx_mouse.c
+    src/clx_savestate.c
     src/clx_gyro.c
 )
 
@@ -75,7 +78,7 @@ else()
     add_executable(${PROJECT_NAME} ${GAME_SOURCES} ${RECOMP_GEN_SOURCES})
 endif()
 
-target_link_libraries(${PROJECT_NAME} PRIVATE xboxrecomp)
+target_link_libraries(${PROJECT_NAME} PRIVATE xboxrecomp ZLIB::ZLIB)
 
 # Movies: VP6 decoded by FFmpeg instead of the lifted On2 decoder
 # (src/movie_vp6.c). NFSU2_FFMPEG_DIR is an install of the minimal LGPL

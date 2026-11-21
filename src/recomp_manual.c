@@ -33,6 +33,7 @@
 #include "platform/frame_stats.h"
 #include "clx_settings.h"
 #include "clx_mouse.h"
+#include "clx_savestate.h"
 
 /* ── ICALL trace ring buffer ───────────────────────────────── */
 
@@ -134,6 +135,11 @@ static uint32_t clx_lat_seq(void)
 void sub_0053C190(void)
 {
     static int exec = -1, low = -1;
+
+    if (MEM32(esp) == 0x0053D75Eu || MEM32(esp) == 0x0053D7A0u) {
+        clx_savestate_tick();
+    }
+
     uint32_t dev = MEM32(CLX_D3D_DEVICE_PTR);
     uint32_t sem = dev ? MEM32(dev + 0x30) : 0;
 

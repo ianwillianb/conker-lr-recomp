@@ -339,6 +339,7 @@ static void fatal(const char *msg)
 
 #include "platform/frame_stats.h"
 #include "clx_settings.h"
+#include "clx_savestate.h"
 #include "usb/usb_gamepad.h"
 static int game_main(void);
 
@@ -573,6 +574,7 @@ static int game_main(void)
     g_xbox_mem_offset = xbox_GetMemoryOffset();
     printf("Xbox memory mapped at host offset 0x%llX\n",
            (unsigned long long)g_xbox_mem_offset);
+    clx_savestate_init();
 
     /* The emulated APU. DirectSound's accesses reach it through the MMIO
      * accessors the DSOUND section is lifted with (regen.sh passes

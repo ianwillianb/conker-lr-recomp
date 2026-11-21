@@ -35,6 +35,7 @@ typedef struct {
     volatile int gyro_invert_x;  /* 1 = gyro left/right reversed */
     volatile int gyro_invert_y;  /* 1 = gyro up/down reversed (on top of the vertical aim inversion) */
     volatile int gyro_roll;      /* -400..400: % of a sideways roll added to the gyro's turn (file only) */
+    volatile int state_slot;     /* 1..5: active save state slot */
 } ClxSettings;
 
 extern ClxSettings g_clx;
@@ -70,6 +71,7 @@ int clx_gyro_aim(float dt, int inverted, float *right, float *up);
 
 /* The in-game menu (clx_menu.c), called from clx_pad_hook. */
 void clx_menu_hook(unsigned char *report, unsigned host_buttons);
+void clx_menu_close(void);
 
 /* usb_gamepad_hook (clx_rumble.c): the damage rumble, then the menu where
  * there is one. */

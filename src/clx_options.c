@@ -83,9 +83,9 @@ void clx_bind_reset(void)
 
 ClxSettings g_clx = {
 #if defined(__SWITCH__)
-    0, 0, 0, 0, 100, 1, 0, 100, 150, 225, 16, 1, 1, 1, 1, 1, 1, 1, 0, 100 /* Switch button icons */
+    0, 0, 0, 0, 100, 1, 0, 100, 150, 225, 16, 1, 1, 1, 1, 1, 1, 1, 0, 100, 0, 0, 0, 1 /* Switch button icons, state_slot=1 */
 #else
-    0, 0, 0, 0, 100, 1, 0, 100, 100, 225, 16, 1, 0, 1, 1, 1, 1, 1, 0, 100 /* PC: render scale 100%, Xbox icons */
+    0, 0, 0, 0, 100, 1, 0, 100, 100, 225, 16, 1, 0, 1, 1, 1, 1, 1, 0, 100, 0, 0, 0, 1 /* PC: render scale 100%, Xbox icons, state_slot=1 */
 #endif
 };
 
@@ -173,6 +173,7 @@ void clx_options_load(void)
             else if (!strcmp(line, "vignette")) g_clx.vignette = on(v);
             else if (!strcmp(line, "grass_wind")) g_clx.grass_wind = on(v);
             else if (!strcmp(line, "language")) g_clx.language = (int)xbox_eeprom_language(v);
+            else if (!strcmp(line, "state_slot")) g_clx.state_slot = atoi(v);
             else if (!strcmp(line, "fullscreen"))
                 setenv("CLX_BORDERLESS",
                        (!strcmp(v, "borderless") || !strcmp(v, "fullscreen") || on(v)) ? "1" : "0", 0);
@@ -202,6 +203,7 @@ void clx_options_load(void)
     if ((e = getenv("CLX_GRASS_WIND"))) g_clx.grass_wind = *e == '1';
     if ((e = getenv("RECOMP_LANGUAGE"))) g_clx.language = (int)xbox_eeprom_language(e);
     if (g_clx.language < 1 || g_clx.language > 6) g_clx.language = 1;
+    if (g_clx.state_slot < 1 || g_clx.state_slot > 5) g_clx.state_slot = 1;
     g_clx.fps_osd = on(getenv("RECOMP_FPS_OSD"));
     if ((e = getenv("RECOMP_AUDIO_VOLUME"))) g_clx.volume = atoi(e);
     if (g_clx.volume < 0 || g_clx.volume > 100) g_clx.volume = 100;
@@ -229,7 +231,7 @@ static const char *const k_keys[] = {
     "gyro_invert_x", "gyro_invert_y",
     "bubble", "fps_counter",
     "volume", "scale_handheld", "scale_docked", "aniso", "fxaa", "button_glyphs",
-    "vignette", "grass_wind", "language",
+    "vignette", "grass_wind", "language", "state_slot",
 };
 
 static int owned(const char *line)
@@ -268,7 +270,7 @@ int clx_options_save(void)
     fprintf(out, "aspect=%s\nfps=%d\ncamera=%s\ncamera_invert_y=%d\naim_speed=%d\ngyro_aim=%d\n"
             "gyro_sens=%d\ngyro_invert_x=%d\ngyro_invert_y=%d\nbubble=%s\n"
             "fps_counter=%d\nvolume=%d\nscale_handheld=%d\nscale_docked=%d\naniso=%d\nfxaa=%d\n"
-            "button_glyphs=%s\nvignette=%d\ngrass_wind=%d\nlanguage=%s\n",
+            "button_glyphs=%s\nvignette=%d\ngrass_wind=%d\nlanguage=%s\nstate_slot=%d\n",
             clx_aspect_name(g_clx.aspect), g_clx.fps60 ? 60 : 30,
             g_clx.cam_free ? "free" : "classic", g_clx.cam_invert ? 1 : 0, g_clx.aim_speed,
             g_clx.gyro_aim ? 1 : 0, g_clx.gyro_sens,
@@ -276,7 +278,8 @@ int clx_options_save(void)
             g_clx.bubble_wide ? "wide" : "classic", g_clx.fps_osd ? 1 : 0, g_clx.volume,
             g_clx.scale_handheld, g_clx.scale_docked, g_clx.aniso, g_clx.fxaa ? 1 : 0,
             g_clx.glyphs == 0 ? "xbox" : g_clx.glyphs == 2 ? "ps" : "switch",
-            g_clx.vignette ? 1 : 0, g_clx.grass_wind ? 1 : 0, clx_language_name(g_clx.language));
+            g_clx.vignette ? 1 : 0, g_clx.grass_wind ? 1 : 0, clx_language_name(g_clx.language),
+            g_clx.state_slot);
 #if CLX_PC_INPUT
     {
         int i;
