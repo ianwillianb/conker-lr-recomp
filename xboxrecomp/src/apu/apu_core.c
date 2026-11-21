@@ -46,7 +46,7 @@ struct McpxApuDebug g_dbg_cache;
 int g_dbg_voice_monitor = -1;
 
 #define MCPX_APU_SAVESTATE_MAGIC 0x31555041u
-#define MCPX_APU_SAVESTATE_VERSION 1u
+#define MCPX_APU_SAVESTATE_VERSION 2u
 #define MCPX_APU_SAVESTATE_MAX_PCM_BYTES (128u * 1024u * 1024u)
 
 typedef struct MCPXAPUMixerVoiceSnapshot {
@@ -64,6 +64,7 @@ typedef struct MCPXAPUSavestate {
     uint32_t version;
     uint32_t total_size;
     uint32_t pcm_bytes;
+    uint32_t output_queue_bytes;
     uint32_t regs[0x20000];
     uint32_t gp_regs[0x10000];
     uint32_t ep_regs[0x10000];
@@ -93,6 +94,7 @@ typedef struct MCPXAPUSavestate {
 typedef struct MCPXAPUSavestateRestorePlan {
     MCPXAPUSavestate snapshot;
     int16_t *pcm_data[APU_MIXER_MAX_VOICES];
+    uint8_t *output_queue;
 } MCPXAPUSavestateRestorePlan;
 
 static int apu_limiter_state_valid(const ApuLimiter *limiter)
@@ -405,6 +407,8 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
         qemu_mutex_unlock(&d->lock);
         Sleep(1);
         qemu_mutex_lock(&d->lock);
+        if (d->savestate_pause_requested)
+            return;
         if (++wait_loops > 50) break;
     }
 
@@ -688,6 +692,8 @@ static void *mcpx_apu_frame_thread(void *arg)
         } else {
             /* Lightweight: just monitor frame (test tone + software mixer) */
             mcpx_apu_monitor_frame(d);
+            if (d->savestate_pause_requested)
+                continue;
             d->ep_frame_div++;
         }
 
@@ -719,6 +725,36 @@ static void mcpx_apu_resume(MCPXAPUState *d)
     qemu_cond_signal(&d->cond);
 }
 
+static int apu_pause_output_device(void)
+{
+    if (xa2_is_active())
+        return xa2_pause_output();
+    if (g_waveout.initialized) {
+#if defined(_WIN32)
+        MMRESULT mr = waveOutPause(g_waveout.hwo);
+        if (mr != MMSYSERR_NOERROR) {
+            fprintf(stderr, "[APU] waveOutPause failed for save state (error %u)\n", mr);
+            return 0;
+        }
+#endif
+    }
+    return 1;
+}
+
+static void apu_resume_output_device(void)
+{
+    if (xa2_is_active()) {
+        if (!xa2_resume_output())
+            fprintf(stderr, "[APU] host audio output could not be resumed after save state\n");
+    } else if (g_waveout.initialized) {
+#if defined(_WIN32)
+        MMRESULT mr = waveOutRestart(g_waveout.hwo);
+        if (mr != MMSYSERR_NOERROR)
+            fprintf(stderr, "[APU] waveOutRestart failed after save state (error %u)\n", mr);
+#endif
+    }
+}
+
 int mcpx_apu_pause_for_savestate(unsigned timeout_ms)
 {
     MCPXAPUState *d = g_state;
@@ -727,9 +763,13 @@ int mcpx_apu_pause_for_savestate(unsigned timeout_ms)
     if (!d)
         return 1;
 
-    /* The APU worker is independent of the guest lock. Keep guest execution
-     * stopped while waiting for the frame-boundary pause to take effect. */
+    /* Stop playback before waiting for the worker so the audio clock cannot
+     * run ahead while the guest is already stopped for the snapshot. */
     qemu_mutex_lock(&d->lock);
+    if (!apu_pause_output_device()) {
+        qemu_mutex_unlock(&d->lock);
+        return 0;
+    }
     d->savestate_pause_requested = true;
     qemu_cond_broadcast(&d->cond);
     start_ms = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
@@ -737,6 +777,7 @@ int mcpx_apu_pause_for_savestate(unsigned timeout_ms)
         if (qemu_clock_get_ms(QEMU_CLOCK_REALTIME) - start_ms >= (int64_t)timeout_ms) {
             d->savestate_pause_requested = false;
             qemu_cond_broadcast(&d->cond);
+            apu_resume_output_device();
             qemu_mutex_unlock(&d->lock);
             fprintf(stderr, "[APU] timed out pausing for save state\n");
             return 0;
@@ -747,6 +788,7 @@ int mcpx_apu_pause_for_savestate(unsigned timeout_ms)
     if (!paused) {
         d->savestate_pause_requested = false;
         qemu_cond_broadcast(&d->cond);
+        apu_resume_output_device();
     }
     qemu_mutex_unlock(&d->lock);
     return paused;
@@ -755,6 +797,7 @@ int mcpx_apu_pause_for_savestate(unsigned timeout_ms)
 size_t mcpx_apu_savestate_size(void)
 {
     size_t size = sizeof(MCPXAPUSavestate);
+    size_t output_queue_size;
     if (!g_mixer_initialized)
         return 0;
 
@@ -771,6 +814,11 @@ size_t mcpx_apu_savestate_size(void)
     }
     LeaveCriticalSection(&g_mixer_cs);
 
+    output_queue_size = xa2_queue_snapshot_size();
+    if (size == 0 || output_queue_size == 0 ||
+        size > SIZE_MAX - output_queue_size)
+        return 0;
+    size += output_queue_size;
     if (size == 0 || size > UINT32_MAX ||
         size - sizeof(MCPXAPUSavestate) > MCPX_APU_SAVESTATE_MAX_PCM_BYTES)
         return 0;
@@ -782,10 +830,12 @@ int mcpx_apu_savestate_save(void *buffer, size_t buffer_size)
     MCPXAPUState *d = g_state;
     MCPXAPUSavestate *snapshot = (MCPXAPUSavestate *)buffer;
     uint8_t *pcm_cursor;
+    size_t output_queue_size = xa2_queue_snapshot_size();
     size_t required = mcpx_apu_savestate_size();
     int ok = 0;
 
-    if (!d || !buffer || required == 0 || buffer_size != required)
+    if (!d || !buffer || required == 0 || buffer_size != required ||
+        output_queue_size == 0 || output_queue_size > buffer_size - sizeof(*snapshot))
         return 0;
 
     qemu_mutex_lock(&d->lock);
@@ -794,7 +844,8 @@ int mcpx_apu_savestate_save(void *buffer, size_t buffer_size)
     snapshot->magic = MCPX_APU_SAVESTATE_MAGIC;
     snapshot->version = MCPX_APU_SAVESTATE_VERSION;
     snapshot->total_size = (uint32_t)buffer_size;
-    snapshot->pcm_bytes = (uint32_t)(buffer_size - sizeof(*snapshot));
+    snapshot->pcm_bytes = (uint32_t)(buffer_size - sizeof(*snapshot) - output_queue_size);
+    snapshot->output_queue_bytes = (uint32_t)output_queue_size;
     memcpy(snapshot->regs, d->regs, sizeof(snapshot->regs));
     memcpy(snapshot->gp_regs, d->gp.regs, sizeof(snapshot->gp_regs));
     memcpy(snapshot->ep_regs, d->ep.regs, sizeof(snapshot->ep_regs));
@@ -836,6 +887,8 @@ int mcpx_apu_savestate_save(void *buffer, size_t buffer_size)
             pcm_cursor += voice->pcm_bytes;
         }
     }
+    if (!xa2_queue_snapshot_save(pcm_cursor, output_queue_size))
+        goto done;
     ok = 1;
 done:
     LeaveCriticalSection(&g_mixer_cs);
@@ -849,6 +902,7 @@ void *mcpx_apu_savestate_prepare(const void *buffer, size_t buffer_size)
 {
     const MCPXAPUSavestate *snapshot = (const MCPXAPUSavestate *)buffer;
     const uint8_t *pcm_cursor;
+    const uint8_t *queue_cursor;
     uint64_t pcm_bytes = 0;
     MCPXAPUSavestateRestorePlan *plan;
 
@@ -858,7 +912,9 @@ void *mcpx_apu_savestate_prepare(const void *buffer, size_t buffer_size)
         snapshot->magic != MCPX_APU_SAVESTATE_MAGIC ||
         snapshot->version != MCPX_APU_SAVESTATE_VERSION ||
         snapshot->total_size != buffer_size ||
-        snapshot->pcm_bytes != buffer_size - sizeof(*snapshot) ||
+        snapshot->pcm_bytes > buffer_size - sizeof(*snapshot) ||
+        snapshot->output_queue_bytes !=
+            buffer_size - sizeof(*snapshot) - snapshot->pcm_bytes ||
         snapshot->set_irq > 1 || snapshot->in_trap > 1 ||
         snapshot->pause_requested > 1 || snapshot->test_tone_active > 1 ||
         snapshot->ep_frame_div < 0 ||
@@ -870,6 +926,12 @@ void *mcpx_apu_savestate_prepare(const void *buffer, size_t buffer_size)
         !apu_limiter_state_valid(&snapshot->output_limiter) ||
         !mcpx_apu_vp_validate_state(&snapshot->vp)) {
         fprintf(stderr, "[APU] invalid audio snapshot header or VP state\n");
+        return NULL;
+    }
+
+    queue_cursor = (const uint8_t *)buffer + sizeof(*snapshot) + snapshot->pcm_bytes;
+    if (!xa2_queue_snapshot_validate(queue_cursor, snapshot->output_queue_bytes)) {
+        fprintf(stderr, "[APU] invalid host output queue in snapshot\n");
         return NULL;
     }
 
@@ -922,6 +984,12 @@ void *mcpx_apu_savestate_prepare(const void *buffer, size_t buffer_size)
         memcpy(plan->pcm_data[i], pcm_cursor, bytes);
         pcm_cursor += bytes;
     }
+    plan->output_queue = (uint8_t *)malloc(snapshot->output_queue_bytes);
+    if (!plan->output_queue) {
+        mcpx_apu_savestate_discard(plan);
+        return NULL;
+    }
+    memcpy(plan->output_queue, queue_cursor, snapshot->output_queue_bytes);
     return plan;
 }
 
@@ -935,6 +1003,13 @@ void mcpx_apu_savestate_commit(void *restore_plan)
     if (!plan || !d)
         return;
     snapshot = &plan->snapshot;
+
+    if (xa2_is_active() &&
+        !xa2_queue_snapshot_restore(plan->output_queue, snapshot->output_queue_bytes)) {
+        fprintf(stderr, "[APU] host output queue restore failed; clearing queued audio\n");
+        if (!xa2_clear_queue())
+            fprintf(stderr, "[APU] host audio queue could not be cleared after restore failure\n");
+    }
 
     qemu_mutex_lock(&d->lock);
     EnterCriticalSection(&g_mixer_cs);
@@ -990,6 +1065,7 @@ void mcpx_apu_savestate_discard(void *restore_plan)
         return;
     for (int i = 0; i < APU_MIXER_MAX_VOICES; i++)
         free(plan->pcm_data[i]);
+    free(plan->output_queue);
     free(plan);
 }
 
@@ -1001,7 +1077,7 @@ void mcpx_apu_resume_after_savestate(int loaded, int audio_restored)
 
     qemu_mutex_lock(&d->lock);
     if (loaded) {
-        if (xa2_is_active()) {
+        if (xa2_is_active() && !audio_restored) {
             if (!xa2_clear_queue())
                 fprintf(stderr, "[APU] host audio queue could not be fully cleared after load\n");
         } else if (g_waveout.initialized) {
@@ -1021,6 +1097,7 @@ void mcpx_apu_resume_after_savestate(int loaded, int audio_restored)
         d->frame_count = 0;
         d->frame_count_time_ms = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
     }
+    apu_resume_output_device();
     d->next_frame_time_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
     d->sleep_acc_us = 0;
     d->savestate_pause_requested = false;

@@ -4437,8 +4437,8 @@ static volatile LONG s_flip_hooked;
 
 void nv2a_pb_flip_retired(unsigned n)
 {
-    InterlockedExchange(&s_flip_hooked, 1);
     if (n) {
+        InterlockedExchange(&s_flip_hooked, 1);
         InterlockedExchangeAdd(&s_flip_retired, (LONG)n);
         SetEvent(driver_event());
     }

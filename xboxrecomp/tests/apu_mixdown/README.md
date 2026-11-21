@@ -21,7 +21,15 @@ audible while no effect ever was.
     cmake --build build/apu-mixdown
     ctest --test-dir build/apu-mixdown
 
-Two tests, and both matter. `apu_mixdown_all` puts a signal only in bins 6..10
-and requires it to reach the frame buffer. `apu_mixdown_two_bins` requires the
+The two mixdown tests both matter. `apu_mixdown_all` puts a signal only in bins
+6..10 and requires it to reach the frame buffer. `apu_mixdown_two_bins` requires the
 same signal to be *lost* with the switch off — without that arm, a mixdown
 that ignored its own switch would pass.
+
+`apu_savestate_roundtrip` also verifies that a paused APU snapshot restores the
+exact PCM already queued to the host output device. That queue is part of the
+APU timeline: dropping it on load would skip samples produced before the saved
+APU state. The new queue data is covered by save-state format version 6; older
+state files are intentionally rejected. The test reports the queued-PCM window
+before and after restore in milliseconds; this measures pending host-queue audio,
+not the full audible A/V offset or samples already in the device pipeline.

@@ -4,6 +4,7 @@
 #ifndef APU_XAUDIO2_H
 #define APU_XAUDIO2_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 /* Initialize XAudio2. Returns 1 on success, 0 on failure. */
@@ -12,11 +13,24 @@ int xa2_init(void);
 /* Shut down XAudio2 and release all resources. */
 void xa2_shutdown(void);
 
-/* Discard queued host samples and reset output smoothing after a state load. */
+/* Pause/resume device playback without discarding queued samples. */
+int xa2_pause_output(void);
+int xa2_resume_output(void);
+
+/* Discard queued samples after a load; output remains paused until resumed. */
 int xa2_clear_queue(void);
 
 /* Returns 1 if XAudio2 is active. */
 int xa2_is_active(void);
+
+/* Queue snapshots contain the already-processed PCM pending at the host
+ * device. At 48 kHz, each 256-sample block spans 5.33 ms; an eight-block
+ * target represents 42.7 ms, though the actual queue may be shorter.
+ * Device-side latency is not included. Pause the device for save and restore. */
+size_t xa2_queue_snapshot_size(void);
+int xa2_queue_snapshot_save(void *buffer, size_t buffer_size);
+int xa2_queue_snapshot_validate(const void *buffer, size_t buffer_size);
+int xa2_queue_snapshot_restore(const void *buffer, size_t buffer_size);
 
 /* Submit interleaved stereo 16-bit samples. Returns 1 if accepted. */
 int xa2_submit_samples(const int16_t *samples, int num_samples);

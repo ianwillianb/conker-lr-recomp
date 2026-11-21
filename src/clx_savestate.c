@@ -83,7 +83,7 @@ static void save_audio_extension(ClxSaveStateHeader *hdr, uint32_t audio_size,
                                  uint32_t audio_compressed_size, uint32_t audio_crc32)
 {
     uint8_t *ext = hdr->reserved + 9;
-    uint32_t version = 1;
+    uint32_t version = 2;
     uint32_t ext_crc;
 
     memcpy(ext, "APU3", 4);
@@ -137,7 +137,7 @@ static int load_audio_extension(const ClxSaveStateHeader *hdr,
     memcpy(audio_crc32, ext + 16, sizeof(*audio_crc32));
     memcpy(&stored_crc, ext + 20, sizeof(stored_crc));
     actual_crc = (uint32_t)crc32(crc32(0L, Z_NULL, 0), ext, 20);
-    return version == 1 && *audio_size > 0 &&
+    return version == 2 && *audio_size > 0 &&
            *audio_compressed_size > 0 && stored_crc == actual_crc;
 }
 
@@ -421,16 +421,27 @@ int clx_savestate_do_save(int slot)
     hdr.timestamp = (uint64_t)time(NULL);
     if (!wait_for_nv2a_idle(1))
         goto done;
+    /* wait_for_nv2a_idle releases the GIL while draining; keep audio running
+     * with guest execution, then freeze it before the guest stays parked. */
+    if (!mcpx_apu_pause_for_savestate(2000))
+        goto done;
+    apu_paused = 1;
     if (!xbox_Nv2aPausePushbuffer(2000)) {
         fprintf(stderr, "[savestate] timed out pausing the pushbuffer executor\n");
         goto done;
     }
     pb_paused = 1;
-    if (!mcpx_apu_pause_for_savestate(2000))
+    if (xbox_CurrentIrql() == 0 && xbox_IrqlRaisedCount() != 0) {
+        mcpx_apu_resume_after_savestate(0, 0);
+        apu_paused = 0;
+        if (!wait_for_irql_idle(2000))
+            goto done;
+        if (!mcpx_apu_pause_for_savestate(2000))
+            goto done;
+        apu_paused = 1;
+    } else if (!wait_for_irql_idle(2000)) {
         goto done;
-    apu_paused = 1;
-    if (!wait_for_irql_idle(2000))
-        goto done;
+    }
     save_irql_extension(&hdr, xbox_CurrentIrql());
     audio_size = mcpx_apu_savestate_size();
     if (audio_size == 0 || audio_size > UINT32_MAX || audio_size > UINT_MAX) {
@@ -635,6 +646,10 @@ int clx_savestate_do_load(int slot)
     if (slot < 1 || slot > CLX_SAVESTATE_NUM_SLOTS)
         return 0;
     xbox_gil_enter();
+    /* Keep audio paused while validating the file against the frozen guest. */
+    if (!mcpx_apu_pause_for_savestate(2000))
+        goto done;
+    apu_paused = 1;
     get_slot_path(slot, path, sizeof(path), 0);
 
     f = fopen(path, "rb");
@@ -806,18 +821,29 @@ int clx_savestate_do_load(int slot)
         !nv2a_pb_exec_savestate_validate(gpu_copy, gpu_size))
         goto done;
 
+    mcpx_apu_resume_after_savestate(0, 0);
+    apu_paused = 0;
     if (!wait_for_nv2a_idle(1))
         goto done;
+    if (!mcpx_apu_pause_for_savestate(2000))
+        goto done;
+    apu_paused = 1;
     if (!xbox_Nv2aPausePushbuffer(2000)) {
         fprintf(stderr, "[savestate] timed out pausing the pushbuffer executor\n");
         goto done;
     }
     pb_paused = 1;
-    if (!mcpx_apu_pause_for_savestate(2000))
+    if (xbox_CurrentIrql() == 0 && xbox_IrqlRaisedCount() != 0) {
+        mcpx_apu_resume_after_savestate(0, 0);
+        apu_paused = 0;
+        if (!wait_for_irql_idle(2000))
+            goto done;
+        if (!mcpx_apu_pause_for_savestate(2000))
+            goto done;
+        apu_paused = 1;
+    } else if (!wait_for_irql_idle(2000)) {
         goto done;
-    apu_paused = 1;
-    if (!wait_for_irql_idle(2000))
-        goto done;
+    }
     uint32_t live_put = guest_mem32_rd(CLX_NV2A_USER_DMA_PUT);
     uint32_t live_get = guest_mem32_rd(CLX_NV2A_USER_DMA_GET);
     if (live_put != live_get) {
@@ -861,8 +887,13 @@ int clx_savestate_do_load(int slot)
 
     uint8_t live_irql = xbox_CurrentIrql();
     xbox_RestoreCurrentIrql(saved_irql);
+    int irql_holds = xbox_IrqlRaisedCount();
     fprintf(stderr, "[savestate] restored thread IRQL %u -> %u (global holds %d)\n",
-            live_irql, saved_irql, xbox_IrqlRaisedCount());
+            live_irql, saved_irql, irql_holds);
+    if (irql_holds != 0) {
+        fprintf(stderr, "[savestate] runtime still has an IRQL holder after restore\n");
+        xbox_IrqlDumpHolders();
+    }
     if (apu_restore_plan)
         mcpx_apu_savestate_commit(apu_restore_plan);
     g_audio_muted = 0;

@@ -7,12 +7,12 @@
 #include "../../xboxrecomp/include/xbox/recomp_regs.h"
 
 #define CLX_SAVESTATE_MAGIC 0x54534C43 /* "CLST" */
-#define CLX_SAVESTATE_VERSION 5
+#define CLX_SAVESTATE_VERSION 6
 #define CLX_SAVESTATE_NUM_SLOTS 5
 
 typedef struct ClxSaveStateHeader {
     uint32_t magic;              /* CLST (0x54534C43) */
-    uint32_t version;            /* 5 */
+    uint32_t version;            /* 6 */
     uint32_t header_size;        /* sizeof(ClxSaveStateHeader) */
     uint32_t slot;               /* 1..5 */
     uint64_t timestamp;          /* time(NULL) */

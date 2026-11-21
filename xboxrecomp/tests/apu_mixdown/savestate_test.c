@@ -17,9 +17,13 @@ int main(void)
     uint8_t *ram = (uint8_t *)calloc(1, ram_size);
     MCPXAPUState *apu;
     size_t snapshot_size;
+    size_t queue_snapshot_size;
     void *snapshot, *restore_plan;
+    void *queue_snapshot, *restored_queue;
+    uint32_t saved_queue_frames = 0, restored_queue_frames = 0;
     int16_t pcm[] = { 100, 200, 300, 400 };
     int slot;
+    int saved_queue;
     APUMixerVoice *voice;
     ApuLimiter limiter = { 0 }, restored_limiter;
     ApuLimiter dsp_limiter = { 0 }, restored_dsp_limiter;
@@ -34,7 +38,39 @@ int main(void)
         free(ram);
         return 2;
     }
+    if (xa2_is_active()) {
+        mcpx_apu_play_test_tone(apu);
+        int waits = 0;
+        while (xa2_queued() == 0 && waits++ < 500)
+            Sleep(1);
+        if (xa2_queued() == 0) {
+            fprintf(stderr, "audio output did not queue a block before pause test\n");
+            mcpx_apu_shutdown(apu);
+            free(ram);
+            return 1;
+        }
+    }
     if (!mcpx_apu_pause_for_savestate(2000)) {
+        mcpx_apu_shutdown(apu);
+        free(ram);
+        return 1;
+    }
+    int paused_queue = xa2_queued();
+    int paused_ep_frame = apu->ep_frame_div;
+    Sleep(50);
+    if (apu->ep_frame_div != paused_ep_frame ||
+        (xa2_is_active() && xa2_queued() != paused_queue)) {
+        fprintf(stderr, "APU state or host audio queue advanced while paused\n");
+        mcpx_apu_resume_after_savestate(0, 0);
+        mcpx_apu_shutdown(apu);
+        free(ram);
+        return 1;
+    }
+    if (xa2_is_active())
+        mcpx_apu_play_test_tone(apu);
+    mcpx_apu_resume_after_savestate(0, 0);
+    if (!mcpx_apu_pause_for_savestate(2000)) {
+        fprintf(stderr, "could not re-pause APU after save-pause test\n");
         mcpx_apu_shutdown(apu);
         free(ram);
         return 1;
@@ -74,11 +110,26 @@ int main(void)
     dsp_limiter.delay[11][1] = -0.25f;
     mcpx_apu_dsp_set_limiter_state(&dsp_limiter);
 
+    saved_queue = xa2_queued();
+    queue_snapshot_size = xa2_queue_snapshot_size();
+    queue_snapshot = malloc(queue_snapshot_size);
+    if (!queue_snapshot ||
+        !xa2_queue_snapshot_save(queue_snapshot, queue_snapshot_size)) {
+        fprintf(stderr, "could not capture queued host PCM\n");
+        free(queue_snapshot);
+        mcpx_apu_resume_after_savestate(0, 0);
+        mcpx_apu_shutdown(apu);
+        free(ram);
+        return 1;
+    }
+    memcpy(&saved_queue_frames, (uint8_t *)queue_snapshot + sizeof(uint32_t),
+           sizeof(saved_queue_frames));
     snapshot_size = mcpx_apu_savestate_size();
     snapshot = malloc(snapshot_size);
     if (!snapshot || !mcpx_apu_savestate_save(snapshot, snapshot_size)) {
         fprintf(stderr, "could not capture APU state\n");
         free(snapshot);
+        free(queue_snapshot);
         apu_mixer_stop(slot);
         apu_mixer_free_voice(slot);
         mcpx_apu_resume_after_savestate(0, 0);
@@ -108,6 +159,7 @@ int main(void)
     if (!apu || !mcpx_apu_pause_for_savestate(2000)) {
         fprintf(stderr, "could not initialize a fresh APU instance\n");
         free(snapshot);
+        free(queue_snapshot);
         if (apu)
             mcpx_apu_shutdown(apu);
         free(ram);
@@ -118,6 +170,7 @@ int main(void)
     if (!restore_plan) {
         fprintf(stderr, "could not validate APU state\n");
         free(snapshot);
+        free(queue_snapshot);
         mcpx_apu_resume_after_savestate(0, 0);
         mcpx_apu_shutdown(apu);
         free(ram);
@@ -126,6 +179,25 @@ int main(void)
     mcpx_apu_savestate_commit(restore_plan);
     mcpx_apu_savestate_discard(restore_plan);
     free(snapshot);
+    restored_queue = malloc(queue_snapshot_size);
+    int queue_matches = restored_queue &&
+        xa2_queue_snapshot_save(restored_queue, queue_snapshot_size);
+    if (queue_matches) {
+        memcpy(&restored_queue_frames,
+               (uint8_t *)restored_queue + sizeof(uint32_t),
+               sizeof(restored_queue_frames));
+        queue_matches = memcmp(queue_snapshot, restored_queue, queue_snapshot_size) == 0;
+    }
+    printf("Queued PCM: %.2f ms before load, %.2f ms restored; %.2f ms skipped "
+           "(clearing instead would skip %.2f ms).\n",
+           saved_queue_frames * 1000.0 / 48000.0,
+           restored_queue_frames * 1000.0 / 48000.0,
+           (saved_queue_frames > restored_queue_frames
+                ? saved_queue_frames - restored_queue_frames : 0) *
+               1000.0 / 48000.0,
+           saved_queue_frames * 1000.0 / 48000.0);
+    free(restored_queue);
+    free(queue_snapshot);
 
     voice = apu_mixer_get_voice(slot);
     apu_output_get_state(&restored_limiter);
@@ -147,7 +219,8 @@ int main(void)
         restored_dsp_limiter.gain != dsp_limiter.gain ||
         restored_dsp_limiter.target != dsp_limiter.target ||
         restored_dsp_limiter.pos != dsp_limiter.pos ||
-        restored_dsp_limiter.delay[11][1] != dsp_limiter.delay[11][1]) {
+        restored_dsp_limiter.delay[11][1] != dsp_limiter.delay[11][1] ||
+        (xa2_is_active() && (xa2_queued() != saved_queue || !queue_matches))) {
         fprintf(stderr, "APU save-state round trip did not restore audio state\n");
         apu_mixer_stop(slot);
         apu_mixer_free_voice(slot);

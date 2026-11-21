@@ -21,5 +21,10 @@ add_test(NAME apu_mixdown_two_bins COMMAND apu_mixdown_test)
 set_tests_properties(apu_mixdown_two_bins PROPERTIES
                      ENVIRONMENT "RECOMP_APU_MIXDOWN_ALL=0;APU_MIXDOWN_EXPECT=0")
 add_test(NAME apu_savestate_roundtrip COMMAND apu_savestate_test)
+if(WIN32)
+    set(_apu_savestate_test_env "RECOMP_AUDIO=0")
+else()
+    set(_apu_savestate_test_env "RECOMP_AUDIO=1;SDL_AUDIODRIVER=dummy")
+endif()
 set_tests_properties(apu_savestate_roundtrip PROPERTIES
-                     ENVIRONMENT "RECOMP_AUDIO=0")
+                     ENVIRONMENT "${_apu_savestate_test_env}")

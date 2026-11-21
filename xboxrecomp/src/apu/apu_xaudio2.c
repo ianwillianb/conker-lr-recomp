@@ -128,6 +128,28 @@ void xa2_set_master_volume(float v)
     g_xa2_volume = v < 0.0f ? 0.0f : v > 1.0f ? 1.0f : v;
 }
 
+#define XA2_QUEUE_SNAPSHOT_MAGIC 0x51554150u
+#define XA2_QUEUE_SNAPSHOT_MAX_FRAMES 262144u
+
+typedef struct Xa2QueueSnapshotHeader {
+    uint32_t magic;
+    uint32_t frames;
+} Xa2QueueSnapshotHeader;
+
+int xa2_queue_snapshot_validate(const void *buffer, size_t buffer_size)
+{
+    const Xa2QueueSnapshotHeader *header = (const Xa2QueueSnapshotHeader *)buffer;
+    uint64_t expected;
+
+    if (!buffer || buffer_size < sizeof(*header) ||
+        header->magic != XA2_QUEUE_SNAPSHOT_MAGIC ||
+        header->frames > XA2_QUEUE_SNAPSHOT_MAX_FRAMES)
+        return 0;
+    expected = sizeof(*header) +
+               (uint64_t)header->frames * 2u * sizeof(int16_t);
+    return expected == buffer_size;
+}
+
 /* The XAudio2 backend is Windows-only; on other hosts the same xa2_* calls
  * are served by SDL2 audio (below). */
 #if defined(_WIN32)
@@ -142,16 +164,72 @@ void xa2_set_master_volume(float v)
 #define XA2_SAMPLE_RATE   48000
 #define XA2_CHANNELS      2
 #define XA2_BUF_SAMPLES   1024   /* ~21ms per submission */
-#define XA2_NUM_BUFS      12     /* 12 x 256-sample blocks = 64 ms of headroom */
+#define XA2_NUM_BUFS      68     /* Covers the SDL backend's maximum queued PCM. */
 
 static IXAudio2               *g_xa2 = NULL;
 static IXAudio2MasteringVoice *g_xa2_master = NULL;
 static IXAudio2SourceVoice    *g_xa2_source = NULL;
 static int16_t                 g_xa2_bufs[XA2_NUM_BUFS][XA2_BUF_SAMPLES][2];
 static int                     g_xa2_next_buf = 0;
+static uint32_t                g_xa2_buf_frames[XA2_NUM_BUFS];
+static int                     g_xa2_queue_head = 0;
+static int                     g_xa2_queue_count = 0;
+static uint32_t                g_xa2_head_offset = 0;
+static uint64_t                g_xa2_last_samples_played = 0;
 static int                     g_xa2_initialized = 0;
+static int                     g_xa2_output_paused = 0;
 static int                     g_xa2_frames_written = 0;
 static Xa2Stats                g_xa2_stats;
+
+static uint64_t xa2_pending_frames(void)
+{
+    uint64_t frames = 0;
+    for (int i = 0; i < g_xa2_queue_count; i++) {
+        int idx = (g_xa2_queue_head + i) % XA2_NUM_BUFS;
+        uint32_t offset = i == 0 ? g_xa2_head_offset : 0;
+        if (g_xa2_buf_frames[idx] > offset)
+            frames += g_xa2_buf_frames[idx] - offset;
+    }
+    return frames;
+}
+
+static void xa2_consume_frames(uint64_t frames)
+{
+    while (frames && g_xa2_queue_count > 0) {
+        uint32_t available = g_xa2_buf_frames[g_xa2_queue_head] - g_xa2_head_offset;
+        if (frames < available) {
+            g_xa2_head_offset += (uint32_t)frames;
+            return;
+        }
+        frames -= available;
+        g_xa2_buf_frames[g_xa2_queue_head] = 0;
+        g_xa2_queue_head = (g_xa2_queue_head + 1) % XA2_NUM_BUFS;
+        g_xa2_queue_count--;
+        g_xa2_head_offset = 0;
+    }
+}
+
+static void xa2_reconcile_queue(const XAUDIO2_VOICE_STATE *state)
+{
+    uint64_t delta = state->SamplesPlayed >= g_xa2_last_samples_played
+        ? state->SamplesPlayed - g_xa2_last_samples_played
+        : state->SamplesPlayed;
+    uint64_t pending = xa2_pending_frames();
+
+    g_xa2_last_samples_played = state->SamplesPlayed;
+    if (delta > pending)
+        delta = pending;
+    xa2_consume_frames(delta);
+
+    /* Keep the shadow ring consistent if a buffer completion happened between
+     * the backend's polling calls. */
+    while (g_xa2_queue_count > (int)state->BuffersQueued) {
+        g_xa2_buf_frames[g_xa2_queue_head] = 0;
+        g_xa2_queue_head = (g_xa2_queue_head + 1) % XA2_NUM_BUFS;
+        g_xa2_queue_count--;
+        g_xa2_head_offset = 0;
+    }
+}
 
 int xa2_init(void)
 {
@@ -207,7 +285,17 @@ int xa2_init(void)
     }
 
     g_xa2_next_buf = 0;
+    memset(g_xa2_buf_frames, 0, sizeof(g_xa2_buf_frames));
+    g_xa2_queue_head = 0;
+    g_xa2_queue_count = 0;
+    g_xa2_head_offset = 0;
+    {
+        XAUDIO2_VOICE_STATE state;
+        IXAudio2SourceVoice_GetState(g_xa2_source, &state, 0);
+        g_xa2_last_samples_played = state.SamplesPlayed;
+    }
     g_xa2_initialized = 1;
+    g_xa2_output_paused = 0;
     g_xa2_frames_written = 0;
 
     fprintf(stderr, "[XA2] XAudio2 initialized (%d Hz stereo 16-bit, %d x %d-sample buffers)\n",
@@ -241,21 +329,65 @@ void xa2_shutdown(void)
     if (g_xa2_initialized)
         fprintf(stderr, "[XA2] Shut down (%d frames written)\n", g_xa2_frames_written);
     g_xa2_initialized = 0;
+    g_xa2_output_paused = 0;
+    g_xa2_queue_head = g_xa2_queue_count = 0;
+    g_xa2_head_offset = 0;
+}
+
+int xa2_pause_output(void)
+{
+    HRESULT hr;
+    if (!g_xa2_initialized || !g_xa2_source || g_xa2_output_paused)
+        return 1;
+
+    XAUDIO2_VOICE_STATE state;
+    IXAudio2SourceVoice_GetState(g_xa2_source, &state, 0);
+    xa2_reconcile_queue(&state);
+    hr = IXAudio2SourceVoice_Stop(g_xa2_source, 0, XAUDIO2_COMMIT_NOW);
+    if (FAILED(hr)) {
+        fprintf(stderr, "[XA2] pausing output failed (0x%08lX)\n", hr);
+        return 0;
+    }
+    g_xa2_output_paused = 1;
+    return 1;
+}
+
+int xa2_resume_output(void)
+{
+    HRESULT hr;
+    XAUDIO2_VOICE_STATE state;
+    if (!g_xa2_initialized || !g_xa2_source || !g_xa2_output_paused)
+        return 1;
+
+    IXAudio2SourceVoice_GetState(g_xa2_source, &state, 0);
+    g_xa2_last_samples_played = state.SamplesPlayed;
+    hr = IXAudio2SourceVoice_Start(g_xa2_source, 0, XAUDIO2_COMMIT_NOW);
+    if (FAILED(hr)) {
+        fprintf(stderr, "[XA2] resuming output failed (0x%08lX)\n", hr);
+        return 0;
+    }
+    g_xa2_output_paused = 0;
+    return 1;
 }
 
 int xa2_clear_queue(void)
 {
-    HRESULT stop_hr, flush_hr, start_hr;
+    HRESULT stop_hr, flush_hr;
     if (!g_xa2_initialized || !g_xa2_source)
         return 1;
 
     stop_hr = IXAudio2SourceVoice_Stop(g_xa2_source, 0, XAUDIO2_COMMIT_NOW);
     flush_hr = IXAudio2SourceVoice_FlushSourceBuffers(g_xa2_source);
-    start_hr = IXAudio2SourceVoice_Start(g_xa2_source, 0, XAUDIO2_COMMIT_NOW);
     g_xa2_next_buf = 0;
-    if (FAILED(stop_hr) || FAILED(flush_hr) || FAILED(start_hr)) {
-        fprintf(stderr, "[XA2] clearing audio queue failed (stop 0x%08lX, flush 0x%08lX, start 0x%08lX)\n",
-                stop_hr, flush_hr, start_hr);
+    memset(g_xa2_buf_frames, 0, sizeof(g_xa2_buf_frames));
+    g_xa2_queue_head = 0;
+    g_xa2_queue_count = 0;
+    g_xa2_head_offset = 0;
+    if (SUCCEEDED(stop_hr))
+        g_xa2_output_paused = 1;
+    if (FAILED(stop_hr) || FAILED(flush_hr)) {
+        fprintf(stderr, "[XA2] clearing audio queue failed (stop 0x%08lX, flush 0x%08lX)\n",
+                stop_hr, flush_hr);
         return 0;
     }
     return 1;
@@ -278,7 +410,8 @@ int xa2_submit_samples(const int16_t *samples, int num_samples)
 
     if (!g_xa2_initialized || !g_xa2_source) return 0;
 
-    IXAudio2SourceVoice_GetState(g_xa2_source, &state, XAUDIO2_VOICE_NOSAMPLESPLAYED);
+    IXAudio2SourceVoice_GetState(g_xa2_source, &state, 0);
+    xa2_reconcile_queue(&state);
     if ((int)state.BuffersQueued >= XA2_NUM_BUFS) {
         g_xa2_stats.dropped++;
         return 0;
@@ -318,6 +451,10 @@ int xa2_submit_samples(const int16_t *samples, int num_samples)
     if (FAILED(hr)) return 0;
 
     g_xa2_next_buf = (idx + 1) % XA2_NUM_BUFS;
+    g_xa2_buf_frames[idx] = (uint32_t)copy_samples;
+    if (g_xa2_queue_count == 0)
+        g_xa2_queue_head = idx;
+    g_xa2_queue_count++;
     g_xa2_frames_written++;
     g_xa2_stats.submitted++;
     return 1;
@@ -332,8 +469,92 @@ int xa2_queued(void)
 {
     XAUDIO2_VOICE_STATE state;
     if (!g_xa2_initialized || !g_xa2_source) return 0;
-    IXAudio2SourceVoice_GetState(g_xa2_source, &state, XAUDIO2_VOICE_NOSAMPLESPLAYED);
-    return (int)state.BuffersQueued;
+    IXAudio2SourceVoice_GetState(g_xa2_source, &state, 0);
+    xa2_reconcile_queue(&state);
+    return (int)((xa2_pending_frames() + 255u) / 256u);
+}
+
+size_t xa2_queue_snapshot_size(void)
+{
+    XAUDIO2_VOICE_STATE state;
+    uint64_t frames;
+    if (!g_xa2_initialized || !g_xa2_source)
+        return sizeof(Xa2QueueSnapshotHeader);
+    IXAudio2SourceVoice_GetState(g_xa2_source, &state, 0);
+    xa2_reconcile_queue(&state);
+    frames = xa2_pending_frames();
+    if (frames > XA2_QUEUE_SNAPSHOT_MAX_FRAMES)
+        return 0;
+    return sizeof(Xa2QueueSnapshotHeader) + (size_t)frames * 2u * sizeof(int16_t);
+}
+
+int xa2_queue_snapshot_save(void *buffer, size_t buffer_size)
+{
+    Xa2QueueSnapshotHeader *header = (Xa2QueueSnapshotHeader *)buffer;
+    int16_t *pcm;
+    uint64_t frames = 0;
+    if (!buffer || (g_xa2_initialized && !g_xa2_output_paused) ||
+        buffer_size != xa2_queue_snapshot_size())
+        return 0;
+    if (g_xa2_initialized && g_xa2_source) {
+        XAUDIO2_VOICE_STATE state;
+        IXAudio2SourceVoice_GetState(g_xa2_source, &state, 0);
+        xa2_reconcile_queue(&state);
+        frames = xa2_pending_frames();
+    }
+    header->magic = XA2_QUEUE_SNAPSHOT_MAGIC;
+    header->frames = (uint32_t)frames;
+    pcm = (int16_t *)(header + 1);
+    for (int i = 0; i < g_xa2_queue_count; i++) {
+        int idx = (g_xa2_queue_head + i) % XA2_NUM_BUFS;
+        uint32_t offset = i == 0 ? g_xa2_head_offset : 0;
+        uint32_t count = g_xa2_buf_frames[idx] - offset;
+        memcpy(pcm, &g_xa2_bufs[idx][offset][0],
+               (size_t)count * XA2_CHANNELS * sizeof(int16_t));
+        pcm += count * XA2_CHANNELS;
+    }
+    return 1;
+}
+
+int xa2_queue_snapshot_restore(const void *buffer, size_t buffer_size)
+{
+    const Xa2QueueSnapshotHeader *header = (const Xa2QueueSnapshotHeader *)buffer;
+    const int16_t *pcm;
+    uint32_t left;
+    if (!xa2_queue_snapshot_validate(buffer, buffer_size))
+        return 0;
+    if (!g_xa2_initialized || !g_xa2_source)
+        return header->frames == 0;
+    if (!g_xa2_output_paused)
+        return 0;
+    if (header->frames > XA2_NUM_BUFS * XA2_BUF_SAMPLES)
+        return 0;
+    if (!xa2_clear_queue())
+        return 0;
+
+    pcm = (const int16_t *)(header + 1);
+    left = header->frames;
+    while (left) {
+        XAUDIO2_BUFFER xbuf;
+        uint32_t count = left > XA2_BUF_SAMPLES ? XA2_BUF_SAMPLES : left;
+        int idx = g_xa2_next_buf;
+        memcpy(g_xa2_bufs[idx], pcm, (size_t)count * XA2_CHANNELS * sizeof(int16_t));
+        memset(&xbuf, 0, sizeof(xbuf));
+        xbuf.AudioBytes = count * XA2_CHANNELS * sizeof(int16_t);
+        xbuf.pAudioData = (const BYTE *)g_xa2_bufs[idx];
+        if (FAILED(IXAudio2SourceVoice_SubmitSourceBuffer(g_xa2_source, &xbuf, NULL))) {
+            xa2_clear_queue();
+            return 0;
+        }
+        g_xa2_buf_frames[idx] = count;
+        if (g_xa2_queue_count == 0)
+            g_xa2_queue_head = idx;
+        g_xa2_queue_count++;
+        g_xa2_next_buf = (idx + 1) % XA2_NUM_BUFS;
+        pcm += count * XA2_CHANNELS;
+        left -= count;
+    }
+    return 1;
 }
 
 int xa2_queue_target(void)
@@ -380,11 +601,32 @@ void xa2_get_stats(Xa2Stats *out)
 #endif
 
 static SDL_AudioDeviceID g_sdla_dev = 0;
+static int               g_sdla_paused = 0;
 static int               g_sdla_target = SDLA_DEFAULT_BLOCKS;
 static int               g_sdla_frames_written = 0;
+static int16_t           g_sdla_queue_shadow[XA2_QUEUE_SNAPSHOT_MAX_FRAMES * 2u];
+static uint32_t          g_sdla_queue_shadow_frames;
 static Xa2Stats          g_sdla_stats;
 
 static void dump_init(void);
+
+static int sdla_reconcile_queue(void)
+{
+    uint32_t queued_frames =
+        SDL_GetQueuedAudioSize(g_sdla_dev) / (SDLA_CHANNELS * sizeof(int16_t));
+    if (queued_frames > g_sdla_queue_shadow_frames) {
+        fprintf(stderr, "[AUDIO] host queue exceeds the tracked PCM shadow\n");
+        return 0;
+    }
+    if (queued_frames < g_sdla_queue_shadow_frames) {
+        uint32_t consumed = g_sdla_queue_shadow_frames - queued_frames;
+        memmove(g_sdla_queue_shadow,
+                g_sdla_queue_shadow + consumed * SDLA_CHANNELS,
+                (size_t)queued_frames * SDLA_CHANNELS * sizeof(int16_t));
+        g_sdla_queue_shadow_frames = queued_frames;
+    }
+    return 1;
+}
 
 int xa2_init(void)
 {
@@ -423,9 +665,11 @@ int xa2_init(void)
         return 0;
     }
     SDL_PauseAudioDevice(g_sdla_dev, 0);
+    g_sdla_paused = 0;
     dump_init();
 
     g_sdla_frames_written = 0;
+    g_sdla_queue_shadow_frames = 0;
     fprintf(stderr, "[AUDIO] SDL %s output: %d Hz, %d ch, %d-sample device buffer,"
                     " queue %d x %d samples\n",
             SDL_GetCurrentAudioDriver() ? SDL_GetCurrentAudioDriver() : "?",
@@ -439,6 +683,8 @@ void xa2_shutdown(void)
     if (!g_sdla_dev) return;
     SDL_CloseAudioDevice(g_sdla_dev);
     g_sdla_dev = 0;
+    g_sdla_paused = 0;
+    g_sdla_queue_shadow_frames = 0;
     SDL_QuitSubSystem(SDL_INIT_AUDIO);
     fprintf(stderr, "[AUDIO] shut down (%d blocks written, %llu underruns,"
                     " %llu dropped)\n", g_sdla_frames_written,
@@ -448,8 +694,28 @@ void xa2_shutdown(void)
 
 int xa2_clear_queue(void)
 {
-    if (g_sdla_dev)
+    if (g_sdla_dev) {
         SDL_ClearQueuedAudio(g_sdla_dev);
+        g_sdla_queue_shadow_frames = 0;
+    }
+    return 1;
+}
+
+int xa2_pause_output(void)
+{
+    if (g_sdla_dev && !g_sdla_paused) {
+        SDL_PauseAudioDevice(g_sdla_dev, 1);
+        g_sdla_paused = 1;
+    }
+    return 1;
+}
+
+int xa2_resume_output(void)
+{
+    if (g_sdla_dev && g_sdla_paused) {
+        SDL_PauseAudioDevice(g_sdla_dev, 0);
+        g_sdla_paused = 0;
+    }
     return 1;
 }
 
@@ -461,7 +727,59 @@ int xa2_is_active(void)
 int xa2_queued(void)
 {
     if (!g_sdla_dev) return 0;
+    sdla_reconcile_queue();
     return (int)(SDL_GetQueuedAudioSize(g_sdla_dev) / SDLA_BLOCK_BYTES);
+}
+
+size_t xa2_queue_snapshot_size(void)
+{
+    if (g_sdla_dev && (!g_sdla_paused || !sdla_reconcile_queue()))
+        return 0;
+    if (g_sdla_queue_shadow_frames > XA2_QUEUE_SNAPSHOT_MAX_FRAMES)
+        return 0;
+    return sizeof(Xa2QueueSnapshotHeader) +
+           (size_t)g_sdla_queue_shadow_frames * SDLA_CHANNELS * sizeof(int16_t);
+}
+
+int xa2_queue_snapshot_save(void *buffer, size_t buffer_size)
+{
+    Xa2QueueSnapshotHeader *header = (Xa2QueueSnapshotHeader *)buffer;
+    uint32_t frames;
+
+    if (!buffer || (g_sdla_dev &&
+        (!g_sdla_paused || !sdla_reconcile_queue())) ||
+        buffer_size != xa2_queue_snapshot_size())
+        return 0;
+    frames = g_sdla_queue_shadow_frames;
+    header->magic = XA2_QUEUE_SNAPSHOT_MAGIC;
+    header->frames = frames;
+    memcpy(header + 1, g_sdla_queue_shadow,
+           (size_t)frames * SDLA_CHANNELS * sizeof(int16_t));
+    return 1;
+}
+
+int xa2_queue_snapshot_restore(const void *buffer, size_t buffer_size)
+{
+    const Xa2QueueSnapshotHeader *header = (const Xa2QueueSnapshotHeader *)buffer;
+    Uint32 pcm_bytes;
+    if (!xa2_queue_snapshot_validate(buffer, buffer_size))
+        return 0;
+    if (!g_sdla_dev)
+        return header->frames == 0;
+    if (!g_sdla_paused)
+        return 0;
+
+    pcm_bytes = header->frames * SDLA_CHANNELS * sizeof(int16_t);
+    SDL_ClearQueuedAudio(g_sdla_dev);
+    if (pcm_bytes && SDL_QueueAudio(g_sdla_dev, header + 1, pcm_bytes) != 0) {
+        SDL_ClearQueuedAudio(g_sdla_dev);
+        g_sdla_queue_shadow_frames = 0;
+        fprintf(stderr, "[AUDIO] restoring queued PCM failed: %s\n", SDL_GetError());
+        return 0;
+    }
+    memcpy(g_sdla_queue_shadow, header + 1, pcm_bytes);
+    g_sdla_queue_shadow_frames = header->frames;
+    return 1;
 }
 
 int xa2_queue_target(void)
@@ -560,8 +878,16 @@ int xa2_submit_samples(const int16_t *samples, int num_samples)
     apu_output_safety(samples, buf, n);
     dump_block(buf, num_samples);
 
+    if (g_sdla_queue_shadow_frames + (uint32_t)num_samples >
+        XA2_QUEUE_SNAPSHOT_MAX_FRAMES) {
+        fprintf(stderr, "[AUDIO] tracked host queue exceeded its snapshot limit\n");
+        return 0;
+    }
     if (SDL_QueueAudio(g_sdla_dev, buf, (Uint32)(n * sizeof(int16_t))) != 0)
         return 0;
+    memcpy(g_sdla_queue_shadow + g_sdla_queue_shadow_frames * SDLA_CHANNELS,
+           buf, (size_t)n * sizeof(int16_t));
+    g_sdla_queue_shadow_frames += (uint32_t)num_samples;
     g_sdla_frames_written++;
     g_sdla_stats.submitted++;
     return 1;

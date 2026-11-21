@@ -10,7 +10,7 @@
 #include <string.h>
 
 static HRESULT com_result, create_result, master_result, source_result;
-static HRESULT start_result, submit_result;
+static HRESULT start_result, stop_result, flush_result, submit_result;
 static int com_refs, releases, master_destroys, source_destroys, failures;
 static IXAudio2 engine;
 static IXAudio2MasteringVoice master;
@@ -20,7 +20,7 @@ static IXAudio2SourceVoiceVtbl source_vtable;
 /* The fake voice holds exactly as many buffers as the backend's ring, so a
  * submit into a full queue is a ring overwrite. Checked against XA2_NUM_BUFS
  * after the backend is included below. */
-#define TEST_QUEUE 12
+#define TEST_QUEUE 68
 static const BYTE *queued[TEST_QUEUE];
 static BYTE snapshots[TEST_QUEUE][4096];
 static UINT32 queued_bytes[TEST_QUEUE], queue_count;
@@ -91,6 +91,12 @@ static HRESULT fake_submit(const XAUDIO2_BUFFER *buffer)
     return S_OK;
 }
 
+static HRESULT fake_flush(void)
+{
+    if (SUCCEEDED(flush_result)) queue_count = 0;
+    return flush_result;
+}
+
 /* Replace only external APIs; compile the real backend, including its ring. */
 #define CoInitializeEx(...) fake_com_init()
 #define CoUninitialize() ((void)--com_refs)
@@ -104,9 +110,9 @@ static HRESULT fake_submit(const XAUDIO2_BUFFER *buffer)
 #undef IXAudio2SourceVoice_Start
 #define IXAudio2SourceVoice_Start(...) start_result
 #undef IXAudio2SourceVoice_Stop
-#define IXAudio2SourceVoice_Stop(...) ((void)0)
+#define IXAudio2SourceVoice_Stop(...) stop_result
 #undef IXAudio2SourceVoice_FlushSourceBuffers
-#define IXAudio2SourceVoice_FlushSourceBuffers(...) ((void)0)
+#define IXAudio2SourceVoice_FlushSourceBuffers(...) fake_flush()
 #undef IXAudio2SourceVoice_GetState
 #define IXAudio2SourceVoice_GetState(source, state, ...) fake_state(state)
 #undef IXAudio2SourceVoice_SubmitSourceBuffer
@@ -125,7 +131,8 @@ static void reset(void)
     com_refs = releases = master_destroys = source_destroys = 0;
     queue_count = 0;
     com_result = create_result = master_result = source_result = S_OK;
-    start_result = submit_result = S_OK;
+    start_result = stop_result = flush_result = submit_result = S_OK;
+    g_xa2_output_paused = 0;
 }
 
 static void check_init_failures(HRESULT com_hr)
@@ -166,6 +173,10 @@ int main(void)
     int16_t samples[1024][2];
     memset(samples, 1, sizeof(samples));
     CHECK(xa2_submit_samples(&samples[0][0], 1024) == 1);
+    CHECK(xa2_pause_output() == 1 && g_xa2_output_paused);
+    CHECK(queue_count == 1);
+    CHECK(xa2_resume_output() == 1 && !g_xa2_output_paused);
+    CHECK(queue_count == 1);
     submit_result = E_FAIL;
     for (int i = 0; i < 3; i++) {
         memset(samples, 2 + i, sizeof(samples));
@@ -189,6 +200,20 @@ int main(void)
     memset(samples, 9, sizeof(samples));
     CHECK(xa2_submit_samples(&samples[0][0], 1024) == 1);
     check_queued();
+    CHECK(xa2_pause_output() == 1 && g_xa2_output_paused);
+    size_t snapshot_size = xa2_queue_snapshot_size();
+    void *queue_snapshot = malloc(snapshot_size);
+    CHECK(queue_snapshot != NULL);
+    if (queue_snapshot) {
+        CHECK(xa2_queue_snapshot_save(queue_snapshot, snapshot_size));
+        CHECK(xa2_queue_snapshot_validate(queue_snapshot, snapshot_size));
+        CHECK(xa2_clear_queue() == 1 && queue_count == 0 && g_xa2_output_paused);
+        CHECK(xa2_queue_snapshot_restore(queue_snapshot, snapshot_size));
+        CHECK(queue_count == XA2_NUM_BUFS && xa2_queued() == XA2_NUM_BUFS * 4);
+        free(queue_snapshot);
+    }
+    CHECK(xa2_clear_queue() == 1 && queue_count == 0 && g_xa2_output_paused);
+    CHECK(xa2_resume_output() == 1 && !g_xa2_output_paused);
     xa2_shutdown();
     CHECK(!xa2_is_active() && releases == 1);
     CHECK(master_destroys == 1 && source_destroys == 1);

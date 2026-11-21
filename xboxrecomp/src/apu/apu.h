@@ -22,7 +22,7 @@ MCPXAPUState *mcpx_apu_init_standalone(uint8_t *ram_ptr);
 /* Shut down and free the APU state. */
 void mcpx_apu_shutdown(MCPXAPUState *d);
 
-/* Pause audio-frame processing around a guest-memory snapshot/restore. */
+/* Pause audio-frame processing and host playback around a guest snapshot/restore. */
 int mcpx_apu_pause_for_savestate(unsigned timeout_ms);
 void mcpx_apu_resume_after_savestate(int loaded, int audio_restored);
 size_t mcpx_apu_savestate_size(void);
