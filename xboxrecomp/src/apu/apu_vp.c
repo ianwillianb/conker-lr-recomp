@@ -67,10 +67,7 @@ static void set_notify_status(MCPXAPUState *d, uint32_t v, int notifier,
  * ============================================================ */
 
 /* Linear resampler state per voice (see voice_resample). */
-static struct {
-    float pos; float a[2], b[2]; int primed;
-    float buf[32][2]; int head, count;     /* fetched, not yet consumed */
-} s_rs[MCPX_HW_MAX_VOICES];
+static MCPXAPUResamplerState s_rs[MCPX_HW_MAX_VOICES];
 
 static void voice_reset_filters(MCPXAPUState *d, uint16_t v)
 {
@@ -1670,5 +1667,120 @@ void mcpx_apu_vp_reset(MCPXAPUState *d)
     memset(d->vp.voice_locked, 0, sizeof(d->vp.voice_locked));
     for (int v = 0; v < MCPX_HW_MAX_VOICES; v++) {
         hrtf_filter_init(&d->vp.filters[v].hrtf);
+    }
+}
+
+static int svf_output_index(const sv_filter *sv)
+{
+    if (!sv->op) return -1;
+    if (sv->op == &sv->h) return 0;
+    if (sv->op == &sv->b) return 1;
+    if (sv->op == &sv->l) return 2;
+    if (sv->op == &sv->n) return 3;
+    if (sv->op == &sv->p) return 4;
+    return -2;
+}
+
+int mcpx_apu_vp_save_state(MCPXAPUState *d, MCPXAPUVPSnapshot *snapshot)
+{
+    memset(snapshot, 0, sizeof(*snapshot));
+    snapshot->version = 1;
+    snapshot->ssl_base_page = d->vp.ssl_base_page;
+    memcpy(snapshot->ssl, d->vp.ssl, sizeof(snapshot->ssl));
+    snapshot->hrtf_headroom = d->vp.hrtf_headroom;
+    memcpy(snapshot->hrtf_submix, d->vp.hrtf_submix, sizeof(snapshot->hrtf_submix));
+    memcpy(snapshot->submix_headroom, d->vp.submix_headroom, sizeof(snapshot->submix_headroom));
+    memcpy(snapshot->sample_buf, d->vp.sample_buf, sizeof(snapshot->sample_buf));
+    memcpy(snapshot->voice_locked, d->vp.voice_locked, sizeof(snapshot->voice_locked));
+    snapshot->hrtf_current_entry = d->vp.hrtf.current_entry;
+    memcpy(snapshot->hrtf_entries, d->vp.hrtf.entries, sizeof(snapshot->hrtf_entries));
+    snapshot->inbuf_sge_handle = d->vp.inbuf_sge_handle;
+    snapshot->outbuf_sge_handle = d->vp.outbuf_sge_handle;
+    memcpy(snapshot->resamplers, s_rs, sizeof(snapshot->resamplers));
+
+    for (int v = 0; v < MCPX_HW_MAX_VOICES; v++) {
+        MCPXAPUVoiceFilter *src = &d->vp.filters[v];
+        MCPXAPUVoiceFilterSnapshot *dst = &snapshot->filters[v];
+        if (src->resampler)
+            return 0;
+        dst->voice = src->voice;
+        memcpy(dst->resample_buf, src->resample_buf, sizeof(dst->resample_buf));
+        memcpy(&dst->hrtf, &src->hrtf, sizeof(dst->hrtf));
+        for (int ch = 0; ch < 2; ch++) {
+            sv_filter *from = &src->svf[ch];
+            MCPXAPUSVFilterSnapshot *to = &dst->svf[ch];
+            to->f = from->f;
+            to->q = from->q;
+            to->qnrm = from->qnrm;
+            to->h = from->h;
+            to->b = from->b;
+            to->l = from->l;
+            to->p = from->p;
+            to->n = from->n;
+            to->op_index = svf_output_index(from);
+            if (to->op_index == -2)
+                return 0;
+        }
+    }
+    return 1;
+}
+
+int mcpx_apu_vp_validate_state(const MCPXAPUVPSnapshot *snapshot)
+{
+    if (snapshot->version != 1 ||
+        snapshot->hrtf_current_entry < 0 ||
+        snapshot->hrtf_current_entry >= HRTF_ENTRY_COUNT)
+        return 0;
+    for (int v = 0; v < MCPX_HW_MAX_VOICES; v++)
+        for (int ch = 0; ch < 2; ch++)
+            if (snapshot->filters[v].svf[ch].op_index < -1 ||
+                snapshot->filters[v].svf[ch].op_index > 4)
+                return 0;
+    return 1;
+}
+
+void mcpx_apu_vp_restore_state(MCPXAPUState *d, const MCPXAPUVPSnapshot *snapshot)
+{
+    d->vp.ssl_base_page = snapshot->ssl_base_page;
+    memcpy(d->vp.ssl, snapshot->ssl, sizeof(snapshot->ssl));
+    d->vp.hrtf_headroom = snapshot->hrtf_headroom;
+    memcpy(d->vp.hrtf_submix, snapshot->hrtf_submix, sizeof(snapshot->hrtf_submix));
+    memcpy(d->vp.submix_headroom, snapshot->submix_headroom, sizeof(snapshot->submix_headroom));
+    memcpy(d->vp.sample_buf, snapshot->sample_buf, sizeof(snapshot->sample_buf));
+    memcpy(d->vp.voice_locked, snapshot->voice_locked, sizeof(snapshot->voice_locked));
+    d->vp.hrtf.current_entry = snapshot->hrtf_current_entry;
+    memcpy(d->vp.hrtf.entries, snapshot->hrtf_entries, sizeof(snapshot->hrtf_entries));
+    d->vp.inbuf_sge_handle = snapshot->inbuf_sge_handle;
+    d->vp.outbuf_sge_handle = snapshot->outbuf_sge_handle;
+    memcpy(s_rs, snapshot->resamplers, sizeof(s_rs));
+
+    for (int v = 0; v < MCPX_HW_MAX_VOICES; v++) {
+        MCPXAPUVoiceFilter *dst = &d->vp.filters[v];
+        const MCPXAPUVoiceFilterSnapshot *src = &snapshot->filters[v];
+        dst->voice = src->voice;
+        memcpy(dst->resample_buf, src->resample_buf, sizeof(dst->resample_buf));
+        memcpy(&dst->hrtf, &src->hrtf, sizeof(dst->hrtf));
+        for (int ch = 0; ch < 2; ch++) {
+            sv_filter *to = &dst->svf[ch];
+            const MCPXAPUSVFilterSnapshot *from = &src->svf[ch];
+            to->f = from->f;
+            to->q = from->q;
+            to->qnrm = from->qnrm;
+            to->h = from->h;
+            to->b = from->b;
+            to->l = from->l;
+            to->p = from->p;
+            to->n = from->n;
+            switch (from->op_index) {
+            case 0: to->op = &to->h; break;
+            case 1: to->op = &to->b; break;
+            case 2: to->op = &to->l; break;
+            case 3: to->op = &to->n; break;
+            case 4: to->op = &to->p; break;
+            default: to->op = NULL; break;
+            }
+        }
+        if (dst->resampler)
+            src_reset(dst->resampler);
     }
 }

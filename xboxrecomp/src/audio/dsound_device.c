@@ -84,14 +84,10 @@ static HRESULT __stdcall buf_SetBufferData(IDirectSoundBuffer8 *self, const void
 
     /* Update mixer voice with new buffer data */
     if (buf->mixer_slot >= 0 && buf->bits_per_sample == 16) {
-        APUMixerVoice *v = apu_mixer_get_voice(buf->mixer_slot);
-        if (v) {
-            v->pcm_data = (const int16_t *)buf->buffer_data;
-            v->pcm_bytes = buf->buffer_data ? dwBufferBytes : 0;
-            v->play_offset = 0;
-            v->num_channels = buf->channels;
-            v->sample_rate = buf->frequency;
-        }
+        apu_mixer_set_buffer_data(buf->mixer_slot,
+                                  (const int16_t *)buf->buffer_data,
+                                  buf->buffer_data ? dwBufferBytes : 0,
+                                  buf->channels, buf->frequency);
     }
     return S_OK;
 }

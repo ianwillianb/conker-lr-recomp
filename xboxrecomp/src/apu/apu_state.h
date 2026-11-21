@@ -435,6 +435,46 @@ typedef struct MCPXAPUVPState {
     uint32_t outbuf_sge_handle;
 } MCPXAPUVPState;
 
+typedef struct MCPXAPUResamplerState {
+    float pos;
+    float a[2], b[2];
+    int primed;
+    float buf[32][2];
+    int head, count;
+} MCPXAPUResamplerState;
+
+typedef struct MCPXAPUSVFilterSnapshot {
+    float f, q, qnrm, h, b, l, p, n;
+    int32_t op_index;
+} MCPXAPUSVFilterSnapshot;
+
+typedef struct MCPXAPUVoiceFilterSnapshot {
+    uint16_t voice;
+    float resample_buf[NUM_SAMPLES_PER_FRAME * 2];
+    MCPXAPUSVFilterSnapshot svf[2];
+    HrtfFilter hrtf;
+} MCPXAPUVoiceFilterSnapshot;
+
+typedef struct MCPXAPUVPSnapshot {
+    uint32_t version;
+    int ssl_base_page;
+    MCPXAPUVoiceFilterSnapshot filters[MCPX_HW_MAX_VOICES];
+    MCPXAPUResamplerState resamplers[MCPX_HW_MAX_VOICES];
+    MCPXAPUVPSSLData ssl[MCPX_HW_MAX_VOICES];
+    uint8_t hrtf_headroom;
+    uint8_t hrtf_submix[4];
+    uint8_t submix_headroom[NUM_MIXBINS];
+    float sample_buf[NUM_SAMPLES_PER_FRAME][2];
+    uint64_t voice_locked[4];
+    int hrtf_current_entry;
+    struct {
+        float hrir[2][HRTF_NUM_TAPS];
+        float itd;
+    } hrtf_entries[HRTF_ENTRY_COUNT];
+    uint32_t inbuf_sge_handle;
+    uint32_t outbuf_sge_handle;
+} MCPXAPUVPSnapshot;
+
 /* ============================================================
  * GP/EP State (from dsp/gp_ep.h)
  * ============================================================ */
@@ -470,6 +510,7 @@ struct MCPXAPUState {
     QemuCond cond;
     QemuCond idle_cond;
     bool pause_requested;
+    bool savestate_pause_requested;
     bool is_idle;
     volatile LONG lock_waiters;   /* guest-side threads in mcpx_apu_lock_guest */
     bool in_trap;                 /* front end trapped/halted: time stopped */
@@ -537,6 +578,9 @@ void mcpx_apu_vp_init(MCPXAPUState *d);
 void mcpx_apu_vp_finalize(MCPXAPUState *d);
 void mcpx_apu_vp_frame(MCPXAPUState *d, float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME]);
 void mcpx_apu_vp_reset(MCPXAPUState *d);
+int mcpx_apu_vp_save_state(MCPXAPUState *d, MCPXAPUVPSnapshot *snapshot);
+int mcpx_apu_vp_validate_state(const MCPXAPUVPSnapshot *snapshot);
+void mcpx_apu_vp_restore_state(MCPXAPUState *d, const MCPXAPUVPSnapshot *snapshot);
 
 /* DSP functions (stubbed) */
 void mcpx_apu_dsp_init(MCPXAPUState *d);

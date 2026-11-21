@@ -5,6 +5,7 @@
  */
 #pragma once
 
+#include <stddef.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -20,6 +21,15 @@ MCPXAPUState *mcpx_apu_init_standalone(uint8_t *ram_ptr);
 
 /* Shut down and free the APU state. */
 void mcpx_apu_shutdown(MCPXAPUState *d);
+
+/* Pause audio-frame processing around a guest-memory snapshot/restore. */
+int mcpx_apu_pause_for_savestate(unsigned timeout_ms);
+void mcpx_apu_resume_after_savestate(int loaded, int audio_restored);
+size_t mcpx_apu_savestate_size(void);
+int mcpx_apu_savestate_save(void *buffer, size_t buffer_size);
+void *mcpx_apu_savestate_prepare(const void *buffer, size_t buffer_size);
+void mcpx_apu_savestate_commit(void *restore_plan);
+void mcpx_apu_savestate_discard(void *restore_plan);
 
 /* MMIO read from APU register space (addr is offset from 0xFE800000). */
 uint64_t mcpx_apu_mmio_read(MCPXAPUState *d, uint64_t addr, unsigned int size);
@@ -50,6 +60,7 @@ typedef struct APUMixerVoice {
     uint32_t         sample_rate;   /* e.g. 22050, 44100, 48000 */
     uint64_t         play_offset; /* Source frame position, 16 fractional bits */
     float            volume;       /* 0.0 to 1.0 */
+    int16_t         *savestate_pcm_data; /* Owned copy restored from a state */
 } APUMixerVoice;
 
 /* APU frames processed in the last second (1500 = real time) and the frame
@@ -65,6 +76,11 @@ void apu_mixer_free_voice(int slot);
 
 /* Get pointer to a mixer voice for configuration. */
 APUMixerVoice *apu_mixer_get_voice(int slot);
+
+/* Replace a voice's PCM source and release any state-owned copy. */
+void apu_mixer_set_buffer_data(int slot, const int16_t *pcm_data,
+                               uint32_t pcm_bytes, uint32_t num_channels,
+                               uint32_t sample_rate);
 
 /* Seek in PCM bytes (rounded down to a whole frame). Returns 0 if invalid. */
 int apu_mixer_set_position(int slot, uint32_t byte_offset);

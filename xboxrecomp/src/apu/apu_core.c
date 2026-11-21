@@ -24,6 +24,8 @@
 #include "apu_xaudio2.h"
 #include "fpconv.h"
 
+#include <math.h>
+
 /* ============================================================
  * Globals
  * ============================================================ */
@@ -43,12 +45,81 @@ struct McpxApuDebug g_dbg;
 struct McpxApuDebug g_dbg_cache;
 int g_dbg_voice_monitor = -1;
 
+#define MCPX_APU_SAVESTATE_MAGIC 0x31555041u
+#define MCPX_APU_SAVESTATE_VERSION 1u
+#define MCPX_APU_SAVESTATE_MAX_PCM_BYTES (128u * 1024u * 1024u)
+
+typedef struct MCPXAPUMixerVoiceSnapshot {
+    uint32_t pcm_bytes;
+    uint32_t num_channels;
+    uint32_t sample_rate;
+    int32_t active;
+    int32_t looping;
+    uint64_t play_offset;
+    float volume;
+} MCPXAPUMixerVoiceSnapshot;
+
+typedef struct MCPXAPUSavestate {
+    uint32_t magic;
+    uint32_t version;
+    uint32_t total_size;
+    uint32_t pcm_bytes;
+    uint32_t regs[0x20000];
+    uint32_t gp_regs[0x10000];
+    uint32_t ep_regs[0x10000];
+    uint8_t set_irq;
+    uint8_t in_trap;
+    uint8_t pause_requested;
+    uint8_t test_tone_active;
+    int32_t ep_frame_div;
+    int32_t sleep_acc_us;
+    int32_t frame_count;
+    int32_t gp_realtime;
+    int32_t ep_realtime;
+    int32_t monitor_point;
+    int32_t monitor_queued_bytes_low;
+    int32_t monitor_queued_bytes_high;
+    double test_tone_phase;
+    double test_tone_phase_inc;
+    int16_t test_tone_amplitude;
+    uint16_t reserved;
+    int16_t monitor_frame_buf[256][2];
+    MCPXAPUMixerVoiceSnapshot mixer_voices[APU_MIXER_MAX_VOICES];
+    MCPXAPUVPSnapshot vp;
+    ApuLimiter dsp_limiter;
+    ApuLimiter output_limiter;
+} MCPXAPUSavestate;
+
+typedef struct MCPXAPUSavestateRestorePlan {
+    MCPXAPUSavestate snapshot;
+    int16_t *pcm_data[APU_MIXER_MAX_VOICES];
+} MCPXAPUSavestateRestorePlan;
+
+static int apu_limiter_state_valid(const ApuLimiter *limiter)
+{
+    if (!isfinite(limiter->gain) || !isfinite(limiter->target) ||
+        limiter->gain < 0.0f || limiter->gain > 1.0f ||
+        limiter->target < 0.0f || limiter->target > 1.0f ||
+        limiter->pos < 0 || limiter->pos >= APU_LIMITER_LOOKAHEAD ||
+        limiter->hold < 0 || limiter->hold > APU_LIMITER_LOOKAHEAD ||
+        (limiter->init != 0 && limiter->init != 1))
+        return 0;
+    for (int i = 0; i < APU_LIMITER_LOOKAHEAD; i++)
+        for (int ch = 0; ch < 2; ch++)
+            if (!isfinite(limiter->delay[i][ch]))
+                return 0;
+    return 1;
+}
+
 /* APU frames run in the last second (1500 is real time: 48 kHz / 32) and the
  * share of that second the frame thread spent working, for hosts with no
  * other profiler. */
 int mcpx_apu_frames_per_second(void) { return g_dbg.frames_processed; }
 float mcpx_apu_utilization(void) { return g_dbg.utilization; }
 uint64_t g_dbg_muted_voices[4] = { 0 };
+
+void mcpx_apu_dsp_get_limiter_state(ApuLimiter *out);
+void mcpx_apu_dsp_set_limiter_state(const ApuLimiter *state);
 
 /* Global audio mute — disables all AWD/mixer sound playback */
 volatile int g_audio_muted = 0;  /* 0 = audio enabled */
@@ -430,7 +501,8 @@ static void throttle(MCPXAPUState *d)
         qemu_mutex_unlock(&d->lock);
         SwitchToThread();
         qemu_mutex_lock(&d->lock);
-        while (!d->pause_requested && xa2_queued() >= xa2_queue_target())
+        while (!d->pause_requested && !d->savestate_pause_requested &&
+               xa2_queued() >= xa2_queue_target())
             qemu_cond_timedwait(&d->cond, &d->lock, 1);
         d->sleep_acc_us += (int)(qemu_clock_get_us(QEMU_CLOCK_REALTIME) - t0);
         return;
@@ -479,7 +551,7 @@ static void throttle(MCPXAPUState *d)
         d->next_frame_time_us = now_us;
     }
 
-    while (!d->pause_requested) {
+    while (!d->pause_requested && !d->savestate_pause_requested) {
         now_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
         int64_t remaining_ms = (d->next_frame_time_us - now_us) / 1000;
         if (remaining_ms > 0) {
@@ -556,6 +628,16 @@ static void *mcpx_apu_frame_thread(void *arg)
     qemu_mutex_lock(&d->lock);
 
     while (!qatomic_read(&d->exiting)) {
+        if (d->savestate_pause_requested) {
+            d->is_idle = true;
+            qemu_cond_signal(&d->idle_cond);
+            while (d->savestate_pause_requested &&
+                   !qatomic_read(&d->exiting))
+                qemu_cond_wait(&d->cond, &d->lock);
+            d->is_idle = false;
+            continue;
+        }
+
         if (d->pause_requested && !g_test_tone.active && !g_mixer_active_count) {
             d->is_idle = true;
             qemu_cond_signal(&d->idle_cond);
@@ -593,6 +675,8 @@ static void *mcpx_apu_frame_thread(void *arg)
          * need continuous frame delivery regardless of APU register state.
          * The VP/DSP pipeline (se_frame) only runs when registers allow it. */
         throttle(d);
+        if (d->savestate_pause_requested)
+            continue;
 
         bool apu_active = (xcntmode != NV_PAPU_SECTL_XCNTMODE_OFF) &&
                           !(fectl & NV_PAPU_FECTL_FEMETHMODE_TRAPPED) &&
@@ -633,6 +717,315 @@ static void mcpx_apu_resume(MCPXAPUState *d)
 {
     d->pause_requested = false;
     qemu_cond_signal(&d->cond);
+}
+
+int mcpx_apu_pause_for_savestate(unsigned timeout_ms)
+{
+    MCPXAPUState *d = g_state;
+    int64_t start_ms;
+
+    if (!d)
+        return 1;
+
+    /* The APU worker is independent of the guest lock. Keep guest execution
+     * stopped while waiting for the frame-boundary pause to take effect. */
+    qemu_mutex_lock(&d->lock);
+    d->savestate_pause_requested = true;
+    qemu_cond_broadcast(&d->cond);
+    start_ms = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+    while (!d->is_idle && !qatomic_read(&d->exiting)) {
+        if (qemu_clock_get_ms(QEMU_CLOCK_REALTIME) - start_ms >= (int64_t)timeout_ms) {
+            d->savestate_pause_requested = false;
+            qemu_cond_broadcast(&d->cond);
+            qemu_mutex_unlock(&d->lock);
+            fprintf(stderr, "[APU] timed out pausing for save state\n");
+            return 0;
+        }
+        qemu_cond_timedwait(&d->idle_cond, &d->lock, 1);
+    }
+    int paused = !qatomic_read(&d->exiting);
+    if (!paused) {
+        d->savestate_pause_requested = false;
+        qemu_cond_broadcast(&d->cond);
+    }
+    qemu_mutex_unlock(&d->lock);
+    return paused;
+}
+
+size_t mcpx_apu_savestate_size(void)
+{
+    size_t size = sizeof(MCPXAPUSavestate);
+    if (!g_mixer_initialized)
+        return 0;
+
+    EnterCriticalSection(&g_mixer_cs);
+    for (int i = 0; i < APU_MIXER_MAX_VOICES; i++) {
+        APUMixerVoice *voice = &g_mixer_voices[i];
+        if ((voice->pcm_bytes && !voice->pcm_data) ||
+            voice->pcm_bytes > MCPX_APU_SAVESTATE_MAX_PCM_BYTES ||
+            size > SIZE_MAX - voice->pcm_bytes) {
+            size = 0;
+            break;
+        }
+        size += voice->pcm_bytes;
+    }
+    LeaveCriticalSection(&g_mixer_cs);
+
+    if (size == 0 || size > UINT32_MAX ||
+        size - sizeof(MCPXAPUSavestate) > MCPX_APU_SAVESTATE_MAX_PCM_BYTES)
+        return 0;
+    return size;
+}
+
+int mcpx_apu_savestate_save(void *buffer, size_t buffer_size)
+{
+    MCPXAPUState *d = g_state;
+    MCPXAPUSavestate *snapshot = (MCPXAPUSavestate *)buffer;
+    uint8_t *pcm_cursor;
+    size_t required = mcpx_apu_savestate_size();
+    int ok = 0;
+
+    if (!d || !buffer || required == 0 || buffer_size != required)
+        return 0;
+
+    qemu_mutex_lock(&d->lock);
+    EnterCriticalSection(&g_mixer_cs);
+    memset(snapshot, 0, sizeof(*snapshot));
+    snapshot->magic = MCPX_APU_SAVESTATE_MAGIC;
+    snapshot->version = MCPX_APU_SAVESTATE_VERSION;
+    snapshot->total_size = (uint32_t)buffer_size;
+    snapshot->pcm_bytes = (uint32_t)(buffer_size - sizeof(*snapshot));
+    memcpy(snapshot->regs, d->regs, sizeof(snapshot->regs));
+    memcpy(snapshot->gp_regs, d->gp.regs, sizeof(snapshot->gp_regs));
+    memcpy(snapshot->ep_regs, d->ep.regs, sizeof(snapshot->ep_regs));
+    snapshot->set_irq = d->set_irq;
+    snapshot->in_trap = d->in_trap;
+    snapshot->pause_requested = d->pause_requested;
+    snapshot->test_tone_active = g_test_tone.active;
+    snapshot->ep_frame_div = d->ep_frame_div;
+    snapshot->sleep_acc_us = d->sleep_acc_us;
+    snapshot->frame_count = d->frame_count;
+    snapshot->gp_realtime = d->gp.realtime;
+    snapshot->ep_realtime = d->ep.realtime;
+    snapshot->monitor_point = d->monitor.point;
+    snapshot->monitor_queued_bytes_low = d->monitor.queued_bytes_low;
+    snapshot->monitor_queued_bytes_high = d->monitor.queued_bytes_high;
+    snapshot->test_tone_phase = g_test_tone.phase;
+    snapshot->test_tone_phase_inc = g_test_tone.phase_inc;
+    snapshot->test_tone_amplitude = g_test_tone.amplitude;
+    memcpy(snapshot->monitor_frame_buf, d->monitor.frame_buf,
+           sizeof(snapshot->monitor_frame_buf));
+    if (!mcpx_apu_vp_save_state(d, &snapshot->vp))
+        goto done;
+    mcpx_apu_dsp_get_limiter_state(&snapshot->dsp_limiter);
+    apu_output_get_state(&snapshot->output_limiter);
+
+    pcm_cursor = (uint8_t *)buffer + sizeof(*snapshot);
+    for (int i = 0; i < APU_MIXER_MAX_VOICES; i++) {
+        APUMixerVoice *voice = &g_mixer_voices[i];
+        MCPXAPUMixerVoiceSnapshot *saved = &snapshot->mixer_voices[i];
+        saved->pcm_bytes = voice->pcm_bytes;
+        saved->num_channels = voice->num_channels;
+        saved->sample_rate = voice->sample_rate;
+        saved->active = voice->active;
+        saved->looping = voice->looping;
+        saved->play_offset = voice->play_offset;
+        saved->volume = voice->volume;
+        if (voice->pcm_bytes) {
+            memcpy(pcm_cursor, voice->pcm_data, voice->pcm_bytes);
+            pcm_cursor += voice->pcm_bytes;
+        }
+    }
+    ok = 1;
+done:
+    LeaveCriticalSection(&g_mixer_cs);
+    qemu_mutex_unlock(&d->lock);
+    if (!ok)
+        fprintf(stderr, "[APU] could not capture a pointer-safe audio snapshot\n");
+    return ok;
+}
+
+void *mcpx_apu_savestate_prepare(const void *buffer, size_t buffer_size)
+{
+    const MCPXAPUSavestate *snapshot = (const MCPXAPUSavestate *)buffer;
+    const uint8_t *pcm_cursor;
+    uint64_t pcm_bytes = 0;
+    MCPXAPUSavestateRestorePlan *plan;
+
+    if (!g_state || !g_mixer_initialized || !buffer ||
+        buffer_size < sizeof(*snapshot) ||
+        buffer_size > sizeof(*snapshot) + MCPX_APU_SAVESTATE_MAX_PCM_BYTES ||
+        snapshot->magic != MCPX_APU_SAVESTATE_MAGIC ||
+        snapshot->version != MCPX_APU_SAVESTATE_VERSION ||
+        snapshot->total_size != buffer_size ||
+        snapshot->pcm_bytes != buffer_size - sizeof(*snapshot) ||
+        snapshot->set_irq > 1 || snapshot->in_trap > 1 ||
+        snapshot->pause_requested > 1 || snapshot->test_tone_active > 1 ||
+        snapshot->ep_frame_div < 0 ||
+        snapshot->monitor_point < MCPX_APU_DEBUG_MON_AC97 ||
+        snapshot->monitor_point > MCPX_APU_DEBUG_MON_GP_OR_EP ||
+        !isfinite(snapshot->test_tone_phase) ||
+        !isfinite(snapshot->test_tone_phase_inc) ||
+        !apu_limiter_state_valid(&snapshot->dsp_limiter) ||
+        !apu_limiter_state_valid(&snapshot->output_limiter) ||
+        !mcpx_apu_vp_validate_state(&snapshot->vp)) {
+        fprintf(stderr, "[APU] invalid audio snapshot header or VP state\n");
+        return NULL;
+    }
+
+    for (int i = 0; i < APU_MIXER_MAX_VOICES; i++) {
+        const MCPXAPUMixerVoiceSnapshot *voice = &snapshot->mixer_voices[i];
+        uint32_t frame_bytes;
+        if (voice->pcm_bytes == 0) {
+            if (voice->active) {
+                fprintf(stderr, "[APU] invalid active mixer voice %d in snapshot\n", i);
+                return NULL;
+            }
+            continue;
+        }
+        if (voice->pcm_bytes > MCPX_APU_SAVESTATE_MAX_PCM_BYTES ||
+            (voice->num_channels != 1 && voice->num_channels != 2) ||
+            voice->sample_rate == 0 || voice->sample_rate > 192000 ||
+            voice->active < 0 || voice->active > 1 ||
+            voice->looping < 0 || voice->looping > 1 ||
+            !isfinite(voice->volume)) {
+            fprintf(stderr, "[APU] invalid mixer voice %d in snapshot\n", i);
+            return NULL;
+        }
+        frame_bytes = voice->num_channels * sizeof(int16_t);
+        if (voice->pcm_bytes < frame_bytes ||
+            (voice->play_offset >> 16) >= voice->pcm_bytes / frame_bytes) {
+            fprintf(stderr, "[APU] invalid mixer position for voice %d\n", i);
+            return NULL;
+        }
+        pcm_bytes += voice->pcm_bytes;
+    }
+    if (pcm_bytes != snapshot->pcm_bytes) {
+        fprintf(stderr, "[APU] mixer PCM size mismatch in snapshot\n");
+        return NULL;
+    }
+
+    plan = (MCPXAPUSavestateRestorePlan *)calloc(1, sizeof(*plan));
+    if (!plan)
+        return NULL;
+    memcpy(&plan->snapshot, snapshot, sizeof(*snapshot));
+    pcm_cursor = (const uint8_t *)buffer + sizeof(*snapshot);
+    for (int i = 0; i < APU_MIXER_MAX_VOICES; i++) {
+        uint32_t bytes = snapshot->mixer_voices[i].pcm_bytes;
+        if (!bytes)
+            continue;
+        plan->pcm_data[i] = (int16_t *)malloc(bytes);
+        if (!plan->pcm_data[i]) {
+            mcpx_apu_savestate_discard(plan);
+            return NULL;
+        }
+        memcpy(plan->pcm_data[i], pcm_cursor, bytes);
+        pcm_cursor += bytes;
+    }
+    return plan;
+}
+
+void mcpx_apu_savestate_commit(void *restore_plan)
+{
+    MCPXAPUSavestateRestorePlan *plan = (MCPXAPUSavestateRestorePlan *)restore_plan;
+    MCPXAPUSavestate *snapshot;
+    MCPXAPUState *d = g_state;
+    int active_count = 0;
+
+    if (!plan || !d)
+        return;
+    snapshot = &plan->snapshot;
+
+    qemu_mutex_lock(&d->lock);
+    EnterCriticalSection(&g_mixer_cs);
+    memcpy(d->regs, snapshot->regs, sizeof(d->regs));
+    memcpy(d->gp.regs, snapshot->gp_regs, sizeof(d->gp.regs));
+    memcpy(d->ep.regs, snapshot->ep_regs, sizeof(d->ep.regs));
+    mcpx_apu_vp_restore_state(d, &snapshot->vp);
+    d->set_irq = snapshot->set_irq != 0;
+    d->in_trap = snapshot->in_trap != 0;
+    d->pause_requested = snapshot->pause_requested != 0;
+    d->ep_frame_div = snapshot->ep_frame_div;
+    d->sleep_acc_us = snapshot->sleep_acc_us;
+    d->frame_count = snapshot->frame_count;
+    d->gp.realtime = snapshot->gp_realtime != 0;
+    d->ep.realtime = snapshot->ep_realtime != 0;
+    d->monitor.point = (McpxApuDebugMonitorPoint)snapshot->monitor_point;
+    d->monitor.queued_bytes_low = snapshot->monitor_queued_bytes_low;
+    d->monitor.queued_bytes_high = snapshot->monitor_queued_bytes_high;
+    memcpy(d->monitor.frame_buf, snapshot->monitor_frame_buf,
+           sizeof(d->monitor.frame_buf));
+    g_test_tone.active = snapshot->test_tone_active != 0;
+    g_test_tone.phase = snapshot->test_tone_phase;
+    g_test_tone.phase_inc = snapshot->test_tone_phase_inc;
+    g_test_tone.amplitude = snapshot->test_tone_amplitude;
+    apu_output_set_state(&snapshot->output_limiter);
+    mcpx_apu_dsp_set_limiter_state(&snapshot->dsp_limiter);
+
+    for (int i = 0; i < APU_MIXER_MAX_VOICES; i++) {
+        APUMixerVoice *voice = &g_mixer_voices[i];
+        const MCPXAPUMixerVoiceSnapshot *saved = &snapshot->mixer_voices[i];
+        free(voice->savestate_pcm_data);
+        voice->savestate_pcm_data = plan->pcm_data[i];
+        plan->pcm_data[i] = NULL;
+        voice->pcm_data = voice->savestate_pcm_data;
+        voice->pcm_bytes = saved->pcm_bytes;
+        voice->num_channels = saved->num_channels;
+        voice->sample_rate = saved->sample_rate;
+        voice->active = saved->active;
+        voice->looping = saved->looping;
+        voice->play_offset = saved->play_offset;
+        voice->volume = saved->volume;
+        active_count += voice->active != 0;
+    }
+    InterlockedExchange((volatile LONG *)&g_mixer_active_count, active_count);
+    LeaveCriticalSection(&g_mixer_cs);
+    qemu_mutex_unlock(&d->lock);
+}
+
+void mcpx_apu_savestate_discard(void *restore_plan)
+{
+    MCPXAPUSavestateRestorePlan *plan = (MCPXAPUSavestateRestorePlan *)restore_plan;
+    if (!plan)
+        return;
+    for (int i = 0; i < APU_MIXER_MAX_VOICES; i++)
+        free(plan->pcm_data[i]);
+    free(plan);
+}
+
+void mcpx_apu_resume_after_savestate(int loaded, int audio_restored)
+{
+    MCPXAPUState *d = g_state;
+    if (!d)
+        return;
+
+    qemu_mutex_lock(&d->lock);
+    if (loaded) {
+        if (xa2_is_active()) {
+            if (!xa2_clear_queue())
+                fprintf(stderr, "[APU] host audio queue could not be fully cleared after load\n");
+        } else if (g_waveout.initialized) {
+#if defined(_WIN32)
+            MMRESULT mr = waveOutReset(g_waveout.hwo);
+            if (mr != MMSYSERR_NOERROR)
+                fprintf(stderr, "[APU] waveOutReset failed after load (error %u)\n", mr);
+            g_waveout.next_buf = 0;
+#endif
+        }
+        if (!audio_restored) {
+            apu_output_reset();
+            memset(d->monitor.frame_buf, 0, sizeof(d->monitor.frame_buf));
+            d->ep_frame_div = 0;
+            d->pause_requested = false;
+        }
+        d->frame_count = 0;
+        d->frame_count_time_ms = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+    }
+    d->next_frame_time_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+    d->sleep_acc_us = 0;
+    d->savestate_pause_requested = false;
+    qemu_cond_broadcast(&d->cond);
+    qemu_mutex_unlock(&d->lock);
 }
 
 /* ============================================================
@@ -869,6 +1262,8 @@ void apu_mixer_free_voice(int slot)
     if (slot < 0 || slot >= APU_MIXER_MAX_VOICES) return;
     EnterCriticalSection(&g_mixer_cs);
     apu_mixer_stop(slot);
+    free(g_mixer_voices[slot].savestate_pcm_data);
+    g_mixer_voices[slot].savestate_pcm_data = NULL;
     g_mixer_voices[slot].pcm_data = NULL;
     g_mixer_voices[slot].pcm_bytes = 0;
     g_mixer_voices[slot].play_offset = 0;
@@ -879,6 +1274,23 @@ APUMixerVoice *apu_mixer_get_voice(int slot)
 {
     if (slot < 0 || slot >= APU_MIXER_MAX_VOICES) return NULL;
     return &g_mixer_voices[slot];
+}
+
+void apu_mixer_set_buffer_data(int slot, const int16_t *pcm_data,
+                               uint32_t pcm_bytes, uint32_t num_channels,
+                               uint32_t sample_rate)
+{
+    if (slot < 0 || slot >= APU_MIXER_MAX_VOICES) return;
+    EnterCriticalSection(&g_mixer_cs);
+    APUMixerVoice *v = &g_mixer_voices[slot];
+    free(v->savestate_pcm_data);
+    v->savestate_pcm_data = NULL;
+    v->pcm_data = pcm_data;
+    v->pcm_bytes = pcm_bytes;
+    v->num_channels = num_channels;
+    v->sample_rate = sample_rate;
+    v->play_offset = 0;
+    LeaveCriticalSection(&g_mixer_cs);
 }
 
 int apu_mixer_set_position(int slot, uint32_t byte_offset)

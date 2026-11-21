@@ -70,10 +70,10 @@ void apu_limiter_run(ApuLimiter *lim, float *lr, int frames, float ceiling)
  * produce reaches full scale in a headset. Only one output path runs, so
  * one limiter state serves them all. */
 static float g_xa2_volume = 0.5f;
+static ApuLimiter g_output_limiter;
 
 void apu_output_safety(const int16_t *in, int16_t *out, int n)
 {
-    static ApuLimiter lim;
     static int peak_log = -1, in_peak, out_peak;
     static long peak_samples;
     float buf[512 * 2];
@@ -88,7 +88,7 @@ void apu_output_safety(const int16_t *in, int16_t *out, int n)
           ? n - done : (int)(sizeof buf / sizeof buf[0]);
         for (i = 0; i < k; i++)
             buf[i] = (float)in[done + i] * g_xa2_volume;
-        apu_limiter_run(&lim, buf, k / 2, 16384.0f);
+        apu_limiter_run(&g_output_limiter, buf, k / 2, 16384.0f);
         for (i = 0; i < k; i++)
             out[done + i] = (int16_t)lrintf(buf[i]);
     }
@@ -106,6 +106,21 @@ void apu_output_safety(const int16_t *in, int16_t *out, int n)
             peak_samples = 0;
         }
     }
+}
+
+void apu_output_reset(void)
+{
+    memset(&g_output_limiter, 0, sizeof(g_output_limiter));
+}
+
+void apu_output_get_state(ApuLimiter *out)
+{
+    *out = g_output_limiter;
+}
+
+void apu_output_set_state(const ApuLimiter *state)
+{
+    g_output_limiter = *state;
 }
 
 void xa2_set_master_volume(float v)
@@ -226,6 +241,24 @@ void xa2_shutdown(void)
     if (g_xa2_initialized)
         fprintf(stderr, "[XA2] Shut down (%d frames written)\n", g_xa2_frames_written);
     g_xa2_initialized = 0;
+}
+
+int xa2_clear_queue(void)
+{
+    HRESULT stop_hr, flush_hr, start_hr;
+    if (!g_xa2_initialized || !g_xa2_source)
+        return 1;
+
+    stop_hr = IXAudio2SourceVoice_Stop(g_xa2_source, 0, XAUDIO2_COMMIT_NOW);
+    flush_hr = IXAudio2SourceVoice_FlushSourceBuffers(g_xa2_source);
+    start_hr = IXAudio2SourceVoice_Start(g_xa2_source, 0, XAUDIO2_COMMIT_NOW);
+    g_xa2_next_buf = 0;
+    if (FAILED(stop_hr) || FAILED(flush_hr) || FAILED(start_hr)) {
+        fprintf(stderr, "[XA2] clearing audio queue failed (stop 0x%08lX, flush 0x%08lX, start 0x%08lX)\n",
+                stop_hr, flush_hr, start_hr);
+        return 0;
+    }
+    return 1;
 }
 
 int xa2_is_active(void)
@@ -411,6 +444,13 @@ void xa2_shutdown(void)
                     " %llu dropped)\n", g_sdla_frames_written,
             (unsigned long long)g_sdla_stats.underruns,
             (unsigned long long)g_sdla_stats.dropped);
+}
+
+int xa2_clear_queue(void)
+{
+    if (g_sdla_dev)
+        SDL_ClearQueuedAudio(g_sdla_dev);
+    return 1;
 }
 
 int xa2_is_active(void)

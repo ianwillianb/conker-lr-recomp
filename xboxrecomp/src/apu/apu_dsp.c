@@ -103,6 +103,17 @@ static int mcpx_apu_mixdown_all(void)
  * (FX sends 11..31 have no fixed position). */
 #define DM_M3DB 0.70710678f
 static float s_downmix[NUM_MIXBINS][2];
+static ApuLimiter s_mixdown_limiter;
+
+void mcpx_apu_dsp_get_limiter_state(ApuLimiter *out)
+{
+    *out = s_mixdown_limiter;
+}
+
+void mcpx_apu_dsp_set_limiter_state(const ApuLimiter *state)
+{
+    s_mixdown_limiter = *state;
+}
 
 static void downmix_init(void)
 {
@@ -172,6 +183,7 @@ void mcpx_apu_dsp_init(MCPXAPUState *d)
 
     d->gp.realtime = false;
     d->ep.realtime = false;
+    memset(&s_mixdown_limiter, 0, sizeof(s_mixdown_limiter));
     downmix_init();
 
     fprintf(stderr, "[APU] DSP GP/EP initialized (STUBBED - passthrough mode)\n");
@@ -270,7 +282,6 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
     }
 
     if (d->monitor.point != MCPX_APU_DEBUG_MON_VP) {
-        static ApuLimiter lim;
         float lr[NUM_SAMPLES_PER_FRAME][2];
         for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
             /* Bins 2..31 used to be computed and then dropped on the floor.
@@ -327,7 +338,7 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
          * 1.27 in a FlatOut 2 crash), and a hard clamp there is audible
          * distortion. The limiter turns the gain down instead (tanh here
          * used to bend the waveform itself: overdrive on loud effects). */
-        apu_limiter_run(&lim, &lr[0][0], NUM_SAMPLES_PER_FRAME, 1.0f);
+        apu_limiter_run(&s_mixdown_limiter, &lr[0][0], NUM_SAMPLES_PER_FRAME, 1.0f);
 
         /* Convert to 16-bit and write (not accumulate) into frame buffer.
          * Each of the 8 sub-frames writes its own 32-sample slice. */

@@ -8,6 +8,9 @@
 #include <stdlib.h>
 #include <string.h>
 
+int xbox_gil_suspend(void) { return 0; }
+void xbox_gil_resume(int depth) { (void)depth; }
+
 /* The bins a title's 3D positional voices actually land in, from JSRF's own
  * V0BIN..V3BIN. 6 and 8 are even (left), 7 and 9 odd (right), so a mixdown
  * that preserves the guest's stereo pairing puts signal on both channels. */
@@ -19,14 +22,13 @@ int main(void)
     const char *expect_env = getenv("APU_MIXDOWN_EXPECT");
     const int expect_heard = expect_env ? atoi(expect_env) : 1;
 
-    /* Zeroed is deliberately enough: ram_ptr NULL makes dsp_ack_frame return
-     * before it touches guest memory, and monitor.point 0 is MON_AC97, which
-     * is not MON_VP, so the mixdown runs. */
+    /* A null ram_ptr keeps dsp_ack_frame from touching guest memory. */
     MCPXAPUState *d = (MCPXAPUState *)calloc(1, sizeof(*d));
     static float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME];
     int i, b, nonzero_left = 0, nonzero_right = 0;
 
     if (!d) { fprintf(stderr, "out of memory\n"); return 2; }
+    mcpx_apu_dsp_init(d);
 
     /* Signal ONLY above bin 1. Bins 0 and 1 stay silent, so anything that
      * arrives can only have come from the wider mixdown. */
@@ -34,7 +36,8 @@ int main(void)
         for (i = 0; i < NUM_SAMPLES_PER_FRAME; ++i)
             mixbins[b][i] = 0.5f;
 
-    mcpx_apu_dsp_frame(d, mixbins);
+    for (int frame = 0; frame < 3; frame++)
+        mcpx_apu_dsp_frame(d, mixbins);
 
     for (i = 0; i < NUM_SAMPLES_PER_FRAME; ++i) {
         if (d->monitor.frame_buf[i][0]) nonzero_left = 1;
@@ -48,6 +51,8 @@ int main(void)
                     "buffer (left=%d right=%d). Every 3D voice a title plays "
                     "is being discarded.\n",
                     EFFECT_BIN_LO, EFFECT_BIN_HI, nonzero_left, nonzero_right);
+            free(d->gp.dsp);
+            free(d->ep.dsp);
             free(d);
             return 1;
         }
@@ -60,6 +65,8 @@ int main(void)
                     "FAIL: RECOMP_APU_MIXDOWN_ALL=0 still mixed bins above 1 "
                     "(left=%d right=%d), so the on arm proves nothing.\n",
                     nonzero_left, nonzero_right);
+            free(d->gp.dsp);
+            free(d->ep.dsp);
             free(d);
             return 1;
         }
@@ -67,6 +74,8 @@ int main(void)
              "which is the behaviour this change replaces.");
     }
 
+    free(d->gp.dsp);
+    free(d->ep.dsp);
     free(d);
     return 0;
 }

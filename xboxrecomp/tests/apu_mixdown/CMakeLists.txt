@@ -5,6 +5,9 @@ add_subdirectory(../.. runtime)
 add_executable(apu_mixdown_test test_main.c)
 target_include_directories(apu_mixdown_test PRIVATE ../../src ../../src/apu)
 target_link_libraries(apu_mixdown_test PRIVATE xbox_apu)
+add_executable(apu_savestate_test savestate_test.c)
+target_include_directories(apu_savestate_test PRIVATE ../../src ../../src/apu)
+target_link_libraries(apu_savestate_test PRIVATE xbox_apu)
 enable_testing()
 # Registered TWICE, on purpose. mcpx_apu_mixdown_all caches its getenv in a
 # static, so one process can only ever exercise one arm -- and an arm that
@@ -17,3 +20,6 @@ set_tests_properties(apu_mixdown_all PROPERTIES
 add_test(NAME apu_mixdown_two_bins COMMAND apu_mixdown_test)
 set_tests_properties(apu_mixdown_two_bins PROPERTIES
                      ENVIRONMENT "RECOMP_APU_MIXDOWN_ALL=0;APU_MIXDOWN_EXPECT=0")
+add_test(NAME apu_savestate_roundtrip COMMAND apu_savestate_test)
+set_tests_properties(apu_savestate_roundtrip PROPERTIES
+                     ENVIRONMENT "RECOMP_AUDIO=0")

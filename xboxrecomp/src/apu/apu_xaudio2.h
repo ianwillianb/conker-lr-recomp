@@ -12,6 +12,9 @@ int xa2_init(void);
 /* Shut down XAudio2 and release all resources. */
 void xa2_shutdown(void);
 
+/* Discard queued host samples and reset output smoothing after a state load. */
+int xa2_clear_queue(void);
+
 /* Returns 1 if XAudio2 is active. */
 int xa2_is_active(void);
 
@@ -56,5 +59,8 @@ void apu_limiter_run(ApuLimiter *lim, float *lr, int frames, float ceiling);
 /* The same volume + limiter, for any other output path (waveOut). in and out
  * may be the same buffer. */
 void apu_output_safety(const int16_t *in, int16_t *out, int n);
+void apu_output_reset(void);
+void apu_output_get_state(ApuLimiter *out);
+void apu_output_set_state(const ApuLimiter *state);
 
 #endif /* APU_XAUDIO2_H */
