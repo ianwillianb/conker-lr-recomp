@@ -180,6 +180,9 @@ static size_t xbox_TiledApertureSize(void)
 
 static HANDLE g_nv2a_ack_thread = NULL;
 static volatile LONG g_nv2a_ack_stop = 0;
+static volatile LONG s_nv2a_pb_pause_requested = 0;
+static volatile LONG s_nv2a_pb_paused = 0;
+static volatile LONG s_nv2a_flags_paused = 0;
 
 /*
  * NV2A busy-bit acknowledgement.
@@ -1345,10 +1348,36 @@ static void nv2a_thread_pause(int busy)
     }
 }
 
+int xbox_Nv2aPausePushbuffer(unsigned timeout_ms)
+{
+    DWORD start = GetTickCount();
+    InterlockedExchange(&s_nv2a_pb_pause_requested, 1);
+    while (!InterlockedCompareExchange(&s_nv2a_pb_paused, 0, 0) ||
+           !InterlockedCompareExchange(&s_nv2a_flags_paused, 0, 0)) {
+        if (GetTickCount() - start >= timeout_ms) {
+            InterlockedExchange(&s_nv2a_pb_pause_requested, 0);
+            return 0;
+        }
+        Sleep(1);
+    }
+    return 1;
+}
+
+void xbox_Nv2aResumePushbuffer(void)
+{
+    InterlockedExchange(&s_nv2a_pb_pause_requested, 0);
+}
+
 static DWORD WINAPI nv2a_flag_thread(LPVOID param)
 {
     volatile uint32_t *regs = (volatile uint32_t *)param;
     while (!InterlockedCompareExchange(&g_nv2a_ack_stop, 0, 0)) {
+        if (InterlockedCompareExchange(&s_nv2a_pb_pause_requested, 0, 0)) {
+            InterlockedExchange(&s_nv2a_flags_paused, 1);
+            Sleep(1);
+            continue;
+        }
+        InterlockedExchange(&s_nv2a_flags_paused, 0);
         nv2a_ack_flags(regs);
         nv2a_thread_pause(0);
     }
@@ -1389,6 +1418,12 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
     xbox_nx_pin_executor();
     fs_thread(FS_T_EXEC);
     while (!InterlockedCompareExchange(&g_nv2a_ack_stop, 0, 0)) {
+        if (InterlockedCompareExchange(&s_nv2a_pb_pause_requested, 0, 0)) {
+            InterlockedExchange(&s_nv2a_pb_paused, 1);
+            Sleep(1);
+            continue;
+        }
+        InterlockedExchange(&s_nv2a_pb_paused, 0);
         nv2a_ack_flags(regs);
         recomp_hw_progress();
         pvideo_tick(regs);
@@ -1591,6 +1626,9 @@ static void xbox_Nv2aAckStart(void)
     dsp_ack_init();
     poke_init();
     g_nv2a_ack_stop = 0;
+    s_nv2a_pb_pause_requested = 0;
+    s_nv2a_pb_paused = 0;
+    s_nv2a_flags_paused = 0;
     g_nv2a_ack_thread = CreateThread(NULL, 0, nv2a_ack_thread,
                                      g_nv2a_memory, 0, NULL);
     /* ponytail: not joined at shutdown; it only reads and writes guest RAM
@@ -4160,4 +4198,108 @@ void xbox_HeapFree(uint32_t xbox_va)
 HANDLE xbox_GetMappingHandle(void)
 {
     return g_mapping_handle;
+}
+
+void *xbox_GetContigMemoryBase(void)
+{
+    return g_contig_memory;
+}
+
+size_t xbox_GetContigMemoryUsed(void)
+{
+    if (!g_contig_memory) return 0;
+    if (g_contig_hwm <= XBOX_CONTIG_BASE) return 0;
+    size_t used = g_contig_hwm - XBOX_CONTIG_BASE;
+    if (used > XBOX_CONTIG_SIZE) used = XBOX_CONTIG_SIZE;
+    return used;
+}
+
+size_t xbox_MemLayoutSave(XboxMemLayoutSnapshot *snap, void *blocks_buf, size_t max_buf_size)
+{
+    if (!snap) return 0;
+    memset(snap, 0, sizeof(*snap));
+
+    AcquireSRWLockExclusive(&g_heap_lock);
+    AcquireSRWLockExclusive(&g_contig_lock);
+
+    snap->heap_next = g_heap_next;
+    snap->heap_alloc_count = g_heap_alloc_count;
+    snap->heap_block_count = g_heap_block_count;
+
+    snap->contig_next = g_contig_next;
+    snap->contig_hwm = g_contig_hwm;
+    snap->contig_start = g_contig_start;
+    snap->contig_count = g_contig_count;
+    snap->thread_stacks_used = g_thread_stacks_used;
+    snap->contig_used_bytes = (uint32_t)xbox_GetContigMemoryUsed();
+
+    size_t needed = (size_t)(g_heap_block_count + g_contig_count) * sizeof(XboxMemLayoutBlock);
+    if (!blocks_buf || max_buf_size < needed) {
+        ReleaseSRWLockExclusive(&g_contig_lock);
+        ReleaseSRWLockExclusive(&g_heap_lock);
+        return needed;
+    }
+
+    XboxMemLayoutBlock *out = (XboxMemLayoutBlock *)blocks_buf;
+    for (int i = 0; i < g_heap_block_count; i++) {
+        out[i].addr = g_heap_blocks[i].addr;
+        out[i].size = g_heap_blocks[i].size;
+        out[i].free = g_heap_blocks[i].free;
+        out[i].pad[0] = out[i].pad[1] = out[i].pad[2] = 0;
+    }
+    for (int i = 0; i < g_contig_count; i++) {
+        int idx = g_heap_block_count + i;
+        out[idx].addr = g_contig_blocks[i].addr;
+        out[idx].size = g_contig_blocks[i].size;
+        out[idx].free = g_contig_blocks[i].free;
+        out[idx].pad[0] = out[idx].pad[1] = out[idx].pad[2] = 0;
+    }
+
+    ReleaseSRWLockExclusive(&g_contig_lock);
+    ReleaseSRWLockExclusive(&g_heap_lock);
+    return needed;
+}
+
+int xbox_MemLayoutRestore(const XboxMemLayoutSnapshot *snap, const void *blocks_buf, size_t buf_size)
+{
+    if (!snap) return 0;
+    if (snap->heap_block_count < 0 || snap->contig_count < 0 ||
+        snap->heap_block_count > XBOX_HEAP_MAX_BLOCKS ||
+        snap->contig_count > XBOX_CONTIG_MAX_BLOCKS)
+        return 0;
+
+    size_t needed = ((size_t)snap->heap_block_count + (size_t)snap->contig_count) *
+                    sizeof(XboxMemLayoutBlock);
+    if (buf_size < needed) return 0;
+    if (needed > 0 && !blocks_buf) return 0;
+
+    AcquireSRWLockExclusive(&g_heap_lock);
+    AcquireSRWLockExclusive(&g_contig_lock);
+
+    const XboxMemLayoutBlock *in = (const XboxMemLayoutBlock *)blocks_buf;
+    for (int i = 0; i < snap->heap_block_count; i++) {
+        g_heap_blocks[i].addr = in[i].addr;
+        g_heap_blocks[i].size = in[i].size;
+        g_heap_blocks[i].free = in[i].free;
+    }
+    g_heap_block_count = snap->heap_block_count;
+    g_heap_next = snap->heap_next;
+    g_heap_alloc_count = snap->heap_alloc_count;
+
+    for (int i = 0; i < snap->contig_count; i++) {
+        int idx = snap->heap_block_count + i;
+        g_contig_blocks[i].addr = in[idx].addr;
+        g_contig_blocks[i].size = in[idx].size;
+        g_contig_blocks[i].free = in[idx].free;
+    }
+    g_contig_count = snap->contig_count;
+    g_contig_next = snap->contig_next;
+    g_contig_hwm = snap->contig_hwm;
+    g_contig_start = snap->contig_start;
+
+    g_thread_stacks_used = snap->thread_stacks_used;
+
+    ReleaseSRWLockExclusive(&g_contig_lock);
+    ReleaseSRWLockExclusive(&g_heap_lock);
+    return 1;
 }

@@ -25,6 +25,7 @@
 #include <stddef.h>   /* ptrdiff_t */
 #include <stdlib.h>
 #include <string.h>
+#include <stdatomic.h>
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 
@@ -217,15 +218,16 @@ static int pb_bad_target(uint32_t w, uint32_t at, uint32_t target, uint32_t put)
 }
 static uint32_t s_get = 0xFFFFFFFFu, s_ret;
 static int      s_in_call;
+static atomic_uint s_resync_get;
+static atomic_int s_resync_pending;
 
 /* The title moved GET itself: XDK D3D resets the ring by writing DMA_PUT and
  * DMA_GET together (CDevice::KickOff's restart path). Walking on from the old
  * position would read whatever lies between as commands. */
 void nv2a_pb_resync(uint32_t get_phys)
 {
-    pb_flow(s_get, 0xFFFFFFFFu, get_phys & PB_PHYS_MASK);
-    s_get = get_phys & PB_PHYS_MASK;
-    s_in_call = 0;
+    atomic_store_explicit(&s_resync_get, get_phys & PB_PHYS_MASK, memory_order_relaxed);
+    atomic_store_explicit(&s_resync_pending, 1, memory_order_release);
 }
 
 void nv2a_pb_scan(uint32_t put_phys)
@@ -240,6 +242,12 @@ void nv2a_pb_scan(uint32_t put_phys)
     }
     if (!(s_exec_enabled || s_survey))
         return;
+    if (atomic_exchange_explicit(&s_resync_pending, 0, memory_order_acquire)) {
+        uint32_t get_phys = atomic_load_explicit(&s_resync_get, memory_order_relaxed);
+        pb_flow(s_get, 0xFFFFFFFFu, get_phys);
+        s_get = get_phys;
+        s_in_call = 0;
+    }
     if (s_get == 0xFFFFFFFFu) {               /* never resynced: start at PUT */
         s_get = put;
         return;

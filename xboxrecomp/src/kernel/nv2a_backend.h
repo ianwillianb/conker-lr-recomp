@@ -25,6 +25,7 @@
 #ifndef NV2A_BACKEND_H
 #define NV2A_BACKEND_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 /* The colour surface being drawn into, in real (anti-aliased) pixels.
@@ -186,6 +187,12 @@ extern void (*nv2a_raw_batch_hook)(Nv2aRawBatch *rb, float *attrs);
 /* Register (or, with NULL, remove) the back end. Call before the title starts
  * submitting work; the executor must also be enabled (RECOMP_PB_EXEC). */
 void nv2a_backend_register(const Nv2aBackend *backend);
+
+/* Preserve the executor's guest-visible GPU state across a savestate. */
+size_t nv2a_pb_exec_savestate_size(void);
+int nv2a_pb_exec_savestate_save(void *dst, size_t size);
+int nv2a_pb_exec_savestate_validate(const void *src, size_t size);
+int nv2a_pb_exec_savestate_restore(const void *src, size_t size);
 
 /* Decode a whole texture to 0xAARRGGBB, row-major, width*height entries.
  * Handles every format the executor can sample (swizzled, linear, DXT).

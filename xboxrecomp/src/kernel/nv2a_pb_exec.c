@@ -5205,6 +5205,117 @@ static void peek_chain(void)
 
 int xbox_log_quiet(void);           /* kernel_bridge.c */
 
+typedef struct {
+    uint32_t magic;
+    uint32_t version;
+    uint32_t size;
+} Nv2aPbSaveStateHeader;
+
+#define NV2A_PB_SAVESTATE_MAGIC 0x5350324Eu
+#define NV2A_REGISTER_BYTES 0x01000000u
+
+static void *nv2a_register_base(void)
+{
+    return (uint8_t *)xbox_GetMemoryOffset() + 0xFD000000u;
+}
+
+static size_t nv2a_pb_save_state_size(void)
+{
+    return sizeof(Nv2aPbSaveStateHeader) +
+           NV2A_REGISTER_BYTES +
+           sizeof(s_gpu) + sizeof(s_vp) + sizeof(s_reg) + sizeof(s_reg_dirty) +
+           sizeof(s_tex_reg) + sizeof(s_tex_set) + sizeof(s_sem_va) +
+           sizeof(s_vtx_epoch) + sizeof(s_scanout) +
+           sizeof(s_scan_drawn_offset) + sizeof(s_scan_drawn_pitch) +
+           sizeof(g_nv2a_present_va);
+}
+
+size_t nv2a_pb_exec_savestate_size(void)
+{
+    return nv2a_pb_save_state_size();
+}
+
+int nv2a_pb_exec_savestate_save(void *dst, size_t size)
+{
+    Nv2aPbSaveStateHeader hdr;
+    uint8_t *out = (uint8_t *)dst;
+
+    if (!dst || size != nv2a_pb_save_state_size() || size > UINT32_MAX)
+        return 0;
+    hdr.magic = NV2A_PB_SAVESTATE_MAGIC;
+    hdr.version = 1;
+    hdr.size = (uint32_t)size;
+    memcpy(out, &hdr, sizeof(hdr));
+    out += sizeof(hdr);
+    memcpy(out, nv2a_register_base(), NV2A_REGISTER_BYTES);
+    out += NV2A_REGISTER_BYTES;
+#define SAVE_GPU_PART(part) do { memcpy(out, &(part), sizeof(part)); out += sizeof(part); } while (0)
+    SAVE_GPU_PART(s_gpu);
+    SAVE_GPU_PART(s_vp);
+    SAVE_GPU_PART(s_reg);
+    SAVE_GPU_PART(s_reg_dirty);
+    SAVE_GPU_PART(s_tex_reg);
+    SAVE_GPU_PART(s_tex_set);
+    SAVE_GPU_PART(s_sem_va);
+    SAVE_GPU_PART(s_vtx_epoch);
+    SAVE_GPU_PART(s_scanout);
+    SAVE_GPU_PART(s_scan_drawn_offset);
+    SAVE_GPU_PART(s_scan_drawn_pitch);
+    SAVE_GPU_PART(g_nv2a_present_va);
+#undef SAVE_GPU_PART
+    return 1;
+}
+
+int nv2a_pb_exec_savestate_validate(const void *src, size_t size)
+{
+    Nv2aPbSaveStateHeader hdr;
+    if (!src || size != nv2a_pb_save_state_size())
+        return 0;
+    memcpy(&hdr, src, sizeof(hdr));
+    return hdr.magic == NV2A_PB_SAVESTATE_MAGIC &&
+           hdr.version == 1 && hdr.size == size;
+}
+
+int nv2a_pb_exec_savestate_restore(const void *src, size_t size)
+{
+    const uint8_t *in = (const uint8_t *)src;
+    if (!nv2a_pb_exec_savestate_validate(src, size))
+        return 0;
+    in += sizeof(Nv2aPbSaveStateHeader);
+    memcpy(nv2a_register_base(), in, NV2A_REGISTER_BYTES);
+    in += NV2A_REGISTER_BYTES;
+#define RESTORE_GPU_PART(part) do { memcpy(&(part), in, sizeof(part)); in += sizeof(part); } while (0)
+    RESTORE_GPU_PART(s_gpu);
+    RESTORE_GPU_PART(s_vp);
+    RESTORE_GPU_PART(s_reg);
+    RESTORE_GPU_PART(s_reg_dirty);
+    RESTORE_GPU_PART(s_tex_reg);
+    RESTORE_GPU_PART(s_tex_set);
+    RESTORE_GPU_PART(s_sem_va);
+    RESTORE_GPU_PART(s_vtx_epoch);
+    RESTORE_GPU_PART(s_scanout);
+    RESTORE_GPU_PART(s_scan_drawn_offset);
+    RESTORE_GPU_PART(s_scan_drawn_pitch);
+    RESTORE_GPU_PART(g_nv2a_present_va);
+#undef RESTORE_GPU_PART
+
+    memset(s_vp_stamp, 0, sizeof(s_vp_stamp));
+    if (++s_vp.gen == 0)
+        s_vp.gen = 1;
+    if (++s_vp.prog_gen == 0)
+        s_vp.prog_gen = 1;
+    if (++s_vp.const_gen == 0)
+        s_vp.const_gen = 1;
+    memset(s_vcache, 0, sizeof(s_vcache));
+    s_vcache_gen = 1;
+    s_vpc_cur = NULL;
+    s_vpc_gen = 0;
+    memset(s_reg_dirty, 1, sizeof(s_reg_dirty));
+    InterlockedExchange(&s_flip_retired, 0);
+    InterlockedExchange(&s_flip_hooked, 0);
+    return 1;
+}
+
 void nv2a_pb_exec_report(void)
 {
     if (xbox_log_quiet())
@@ -5217,6 +5328,7 @@ void nv2a_pb_exec_report(void)
          * nothing. */
         find_nan_matrices();
     }
+
     if (getenv("RECOMP_FIND_QUAD")) {
         static int done;
         if (!done) { done = 1; find_quad_vertices(); }

@@ -317,6 +317,14 @@ void xbox_dispatch_reclaim(int lent)
 
 KIRQL xbox_CurrentIrql(void) { return g_current_irql; }
 
+void xbox_RestoreCurrentIrql(KIRQL irql)
+{
+    if (irql < g_current_irql)
+        xbox_KfLowerIrql(irql);
+    else if (irql > g_current_irql)
+        xbox_KfRaiseIrql(irql);
+}
+
 /*
  * KfRaiseIrql - Raises IRQL to the specified level.
  * Returns the previous IRQL. Uses __fastcall (ECX = NewIrql).

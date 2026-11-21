@@ -795,6 +795,8 @@ VOID    __stdcall xbox_HalInitiateShutdown(void);
 BOOLEAN __stdcall xbox_HalIsResetOrShutdownPending(void);
 
 KIRQL   __fastcall xbox_KfRaiseIrql(KIRQL NewIrql);
+KIRQL   xbox_CurrentIrql(void);
+void    xbox_RestoreCurrentIrql(KIRQL Irql);
 /* Non-zero while any thread holds IRQL at or above DISPATCH_LEVEL.
  * Device models ask before delivering an interrupt; raising IRQL masks the
  * line for the whole processor on hardware, not just for one thread. */

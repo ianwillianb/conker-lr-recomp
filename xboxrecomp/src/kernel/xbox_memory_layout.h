@@ -207,6 +207,8 @@ int xbox_Nv2aMirrorFence(uint32_t device_ptr_va,
 int xbox_Nv2aExecSleep(void);
 int xbox_Nv2aWaitWord(uint32_t va, uint32_t fence, unsigned ms);
 void xbox_Nv2aSemaphoreWritten(void);
+int xbox_Nv2aPausePushbuffer(unsigned timeout_ms);
+void xbox_Nv2aResumePushbuffer(void);
 
 /* Complete an audio-DSP command word as soon as the title posts one: the
  * polling thread zeroes it whenever it reads non-zero. The API form of
@@ -552,6 +554,36 @@ uint32_t xbox_HeapBlockSize(uint32_t xbox_va);
  * Returns NULL if file mapping is not available.
  */
 HANDLE xbox_GetMappingHandle(void);
+
+/* ================================================================
+ * Save state memory snapshot support
+ * ================================================================ */
+
+typedef struct XboxMemLayoutBlock {
+    uint32_t addr;
+    uint32_t size;
+    uint8_t  free;
+    uint8_t  pad[3];
+} XboxMemLayoutBlock;
+
+typedef struct XboxMemLayoutSnapshot {
+    uint32_t heap_next;
+    int32_t  heap_alloc_count;
+    int32_t  heap_block_count;
+
+    uint32_t contig_next;
+    uint32_t contig_hwm;
+    uint32_t contig_start;
+    int32_t  contig_count;
+
+    int32_t  thread_stacks_used;
+    uint32_t contig_used_bytes;
+} XboxMemLayoutSnapshot;
+
+void   *xbox_GetContigMemoryBase(void);
+size_t  xbox_GetContigMemoryUsed(void);
+size_t  xbox_MemLayoutSave(XboxMemLayoutSnapshot *snap, void *blocks_buf, size_t max_buf_size);
+int     xbox_MemLayoutRestore(const XboxMemLayoutSnapshot *snap, const void *blocks_buf, size_t buf_size);
 
 #ifdef __cplusplus
 }
